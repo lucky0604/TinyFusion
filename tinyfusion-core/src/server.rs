@@ -1,10 +1,12 @@
 use axum::{
-    routing::get,
+    routing::{get, post},
     Router,
     Json,
 };
 use serde_json::json;
 use tracing::info;
+
+use crate::chat::chat_completions;
 
 /// Run the Axum HTTP server on the configured address and port.
 pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
@@ -31,6 +33,7 @@ async fn health_check() -> Json<serde_json::Value> {
 pub fn app() -> Router {
     Router::new()
         .route("/health", get(health_check))
+        .route("/v1/chat/completions", post(chat_completions))
 }
 
 /// Listen for SIGINT / SIGTERM and trigger graceful shutdown.
