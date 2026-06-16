@@ -1,0 +1,36 @@
+# TinyFusion Progress Log
+Started: 2026-06-16
+---
+
+## Codebase Patterns
+- TinyFusion is a Rust workspace with two crates: tinyfusion-core and tinyfusion-gui
+- Core uses Axum for HTTP server, Tokio for async runtime
+- GUI uses Tauri v2 with React frontend (to be added)
+- Design system follows refined developer console aesthetic (dark-first, Inter font, Lucide icons)
+
+## 2026-06-16 - US-001
+- What was implemented: Rust workspace scaffolding with two crates (tinyfusion-core and tinyfusion-gui)
+- Files changed:
+  - Cargo.toml (workspace root)
+  - tinyfusion-core/Cargo.toml (core crate with axum, tokio, reqwest, serde dependencies)
+  - tinyfusion-core/src/main.rs (entry point)
+  - tinyfusion-core/src/lib.rs (module declarations)
+  - tinyfusion-core/src/server.rs (Axum server with /health endpoint and graceful shutdown)
+  - tinyfusion-core/src/sniffer.rs (request state detection with tests)
+  - tinyfusion-core/src/session.rs (session manager with in-memory storage and tests)
+  - tinyfusion-core/src/moa/mod.rs (MoA worker/judge module with tests)
+  - tinyfusion-core/src/keepalive.rs (SSE keepalive module)
+  - tinyfusion-core/src/oracle.rs (verification command execution with tests)
+  - tinyfusion-core/src/proxy.rs (upstream request forwarding)
+  - tinyfusion-gui/Cargo.toml (Tauri v2 crate)
+  - tinyfusion-gui/build.rs (Tauri build script)
+  - tinyfusion-gui/src/main.rs (Tauri app entry point)
+  - tinyfusion-gui/tauri.conf.json (Tauri config: 1200x800 window, "TinyFusion" title)
+  - tinyfusion-gui/icons/*.png (placeholder RGBA icons)
+  - dist/index.html (minimal frontend placeholder)
+- All 20 tests pass, cargo check passes for both crates
+- **Learnings for future iterations:**
+  - Tauri v2 requires RGBA (not RGB) PNG icons, otherwise build fails
+  - Tauri v2 capabilities directory must not exist if using auto-generated defaults
+  - `cargo check` is the typecheck equivalent for Rust — must pass for all stories
+---

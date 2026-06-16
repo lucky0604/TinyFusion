@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "tinyfusion-core",
+    "tinyfusion-gui",
+]
+resolver = "2"
