@@ -48,3 +48,35 @@ Started: 2026-06-16
   - `tower::ServiceExt` allows testing axum routes without spawning a real server
   - Server `app()` should be a separate public function so tests can construct it independently
 ---
+
+## 2026-06-16 - US-003
+- What was implemented: Config file loading from ~/.tinyfusion/config.json with default creation, typed parsing via serde, and model count logging
+- Files changed:
+  - tinyfusion-core/src/config.rs (new: Config, ModelConfig, WorkspaceConfig structs, load/default creation, 6 tests)
+  - tinyfusion-core/src/lib.rs (added `pub mod config`)
+  - tinyfusion-core/src/main.rs (load config at startup, pass port to server::run)
+  - tinyfusion-core/src/server.rs (run() now accepts port parameter)
+  - tinyfusion-core/Cargo.toml (added tempfile dev dependency for tests)
+- 28 tests pass (22 existing + 6 new config tests), cargo check passes
+- **Learnings for future iterations:**
+  - `tempfile::NamedTempFile` deletes the file when dropped — use `std::fs::write` to a temp directory instead for tests that need the file to persist during the test
+  - Config loading uses `HOME` env var with `USERPROFILE` fallback for Windows compatibility
+  - Server `run()` function accepts `port: u16` rather than hardcoding — this pattern should continue for other configurable values
+---
+
+## 2026-06-16 13:07 - US-004
+- What was implemented: Verified Tauri App Shell acceptance criteria — all scaffolded components from US-001 satisfy US-004 requirements out of the box
+- Files changed:
+  - prd.json (set passes: true for US-004)
+  - progress.txt (appended this entry)
+- Verified:
+  - `cargo check --package tinyfusion-gui` passes
+  - `cargo tauri build` succeeds, producing TinyFusion.app and TinyFusion_0.1.0_aarch64.dmg
+  - App bundle contains correct Info.plist, MacOS binary, and Resources
+  - Icons are RGBA PNG (verified with `file` command)
+  - tauri.conf.json: 1200x800 window, "TinyFusion" title, frontendDist points to ../dist
+  - dist/index.html exists and is minimal but valid
+- **Learnings for future iterations:**
+  - `cargo tauri build` is the correct verification for Tauri app shell (produces .app + .dmg on macOS)
+  - App bundle structure: Contents/{Info.plist, MacOS/, Resources/}
+---
