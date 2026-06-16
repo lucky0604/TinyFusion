@@ -114,4 +114,35 @@ Started: 2026-06-16
   - React Router v7 is installed (not v6) — API is identical for basic usage
   - Lucide React components use `<IconName size={N} />` pattern with pixel sizes
   - When modifying frontend, rebuild with `npx vite build` to update `dist/` for Tauri
+
+## 2026-06-16 15:45 - US-006a
+- What was implemented: Chat completions request parsing with POST /v1/chat/completions endpoint, OpenAI-compatible request validation, and 15 unit tests
+- Files changed:
+  - tinyfusion-core/src/chat.rs (new: ChatMessage, ChatCompletionRequest structs, validate() function, chat_completions handler, 15 tests)
+  - tinyfusion-core/src/lib.rs (added `pub mod chat`)
+  - tinyfusion-core/src/server.rs (added POST /v1/chat/completions route to app router)
+- 43 tests pass (28 existing + 15 new chat tests), cargo check passes with no warnings
+- Validation covers:
+  - Required fields: model, messages (both produce 400 with descriptive errors)
+  - stream defaults to false when omitted
+  - Empty model, empty messages array, empty role/content all rejected
+  - Error messages include field index for multi-message payloads
+- **Learnings for future iterations:**
+  - Handler functions using `axum::Json<T>` need T to be at least `pub(crate)` — private types cause compilation errors when the handler is `pub`
+  - Use `axum::Json<serde_json::Value>` for echo responses during incremental development (keeps types simple until full response struct is needed)
+  - The validate() approach (separate function returning Result<String, String>) is cleaner than deriving axum Extractors for early validation — easier to test and produces better error messages
+---
+
+## 2026-06-16 16:30 - US-006b
+- What was implemented: Chat completions response handling with OpenAI-compatible JSON responses and SSE streaming support
+- Files changed:
+  - tinyfusion-core/src/chat.rs (added: ChatCompletionResponse, Choice, ResponseMessage, Usage, ChatCompletionChunk, StreamingChoice, DeltaMessage types; build_sse_stream() for SSE; updated handler to return JSON or SSE based on stream flag; 10 new tests)
+- 51 tests pass (43 existing + 8 new response formatting tests), cargo check passes
+- Response format includes:
+  - Non-streaming: standard JSON with id (chatcmpl-<hex>), object ("chat.completion"), created (unix timestamp), model, choices (with message role/content/finish_reason), usage (prompt/completion/total tokens)
+  - Streaming: SSE with text/event-stream content type, data: events containing ChatCompletionChunk objects, [DONE] marker
+- **Learnings for future iterations:**
+  - `impl Trait` is not allowed in enum variant fields — use `Pin<Box<dyn Stream>>` for boxing async streams
+  - Enum types used in handler return must be at least `pub(crate)` or axum's `post()` can't see them
+  - When generating responses, use `messages.iter().rev().find(|m| m.role == "user")` to get the last user message content, not `.last()` which picks up assistant messages
 ---
