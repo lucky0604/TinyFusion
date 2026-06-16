@@ -58,6 +58,18 @@ Started: 2026-06-16
   - The forward URL is constructed as `{executor.endpoint}/chat/completions`
 ---
 
+## 2026-06-16 - US-008
+- What was implemented: SSE streaming support with mock upstream integration tests
+- Files changed:
+  - tinyfusion-core/src/proxy.rs: Added 4 SSE integration tests with mock upstream axum server
+- All 46 tests pass (42 existing + 4 new SSE passthrough tests)
+- Tests cover: SSE chunk forwarding, Content-Type header preservation, cache-control headers, stream closure on upstream disconnect, connection refused handling
+- **Learnings for future iterations:**
+  - Mock upstream servers in tests use `tokio::net::TcpListener::bind("127.0.0.1:0")` for random port allocation
+  - `forward_passthrough()` already handles SSE streaming correctly - tests were the missing piece
+  - Test closures using external variables need `move || async move {}` syntax
+---
+
 ## 2026-06-16 - US-002
 - What was implemented: Axum HTTP server setup with health endpoint tests, tracing initialization, and 404 test
 - Files changed:
