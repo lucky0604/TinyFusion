@@ -6,11 +6,13 @@ use axum::{
 use serde_json::json;
 use tracing::info;
 
-use crate::chat::chat_completions;
+use crate::chat::{self, AppState};
+use crate::config::Config;
 
 /// Run the Axum HTTP server on the configured address and port.
-pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let app = app();
+pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    let port = config.port;
+    let app = app(config);
 
     let addr = format!("127.0.0.1:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -29,11 +31,44 @@ async fn health_check() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
 }
 
-/// Build the application router for testing.
-pub fn app() -> Router {
+/// Build the application router with shared state.
+pub fn app(config: Config) -> Router {
+    let state = AppState::new(config);
+
     Router::new()
         .route("/health", get(health_check))
-        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/chat/completions", post(chat::chat_completions))
+        .with_state(state)
+}
+
+/// Build a test router without real config (for testing).
+#[cfg(test)]
+pub fn test_app() -> Router {
+    use reqwest::Client;
+    let state = AppState {
+        config: std::sync::Arc::new(Config {
+            port: 9999,
+            workers: vec![],
+            judge: crate::config::ModelConfig {
+                name: "judge".into(),
+                endpoint: "http://localhost:11434".into(),
+                model_id: "llama3".into(),
+                api_key: None,
+            },
+            executor: crate::config::ModelConfig {
+                name: "executor".into(),
+                endpoint: "http://localhost:11434".into(),
+                model_id: "llama3".into(),
+                api_key: None,
+            },
+            workspaces: std::collections::HashMap::new(),
+        }),
+        client: Client::new(),
+    };
+    Router::new()
+        .route("/health", get(health_check))
+        .route("/v1/chat/completions", post(chat::chat_completions))
+        .with_state(state)
 }
 
 /// Listen for SIGINT / SIGTERM and trigger graceful shutdown.
@@ -71,7 +106,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_health_check_returns_ok() {
-        let app = app();
+        let app = test_app();
         let response = app
             .oneshot(
                 Request::builder()
@@ -93,7 +128,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unknown_route_returns_404() {
-        let app = app();
+        let app = test_app();
         let response = app
             .oneshot(
                 Request::builder()

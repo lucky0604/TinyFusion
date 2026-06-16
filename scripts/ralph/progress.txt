@@ -42,6 +42,22 @@ Started: 2026-06-16
   - `cargo check` is the typecheck equivalent for Rust — must pass for all stories
 ---
 
+## 2026-06-16 - US-007
+- What was implemented: Single model passthrough — chat_completions handler now forwards requests to the executor endpoint from config
+- Files changed:
+  - tinyfusion-core/src/chat.rs: Added AppState with Config+Client, modified chat_completions handler to use `proxy::forward_passthrough`
+  - tinyfusion-core/src/proxy.rs: Fixed Body::wrap_stream → Body::from_stream, removed unused import
+  - tinyfusion-core/src/server.rs: Modified to accept Config, create AppState with axum State extractor, added test_app() helper
+  - tinyfusion-core/src/main.rs: Updated to pass full Config to server::run()
+- All 42 tests pass, cargo check clean
+- **Learnings for future iterations:**
+  - Axum handlers with state use `axum::extract::State<AppState>` extractor
+  - axum 0.7 uses `Body::from_stream` instead of `Body::wrap_stream`
+  - Tests that hit upstream need mock servers or expect error responses (BAD_GATEWAY)
+  - `futures::TryStreamExt` needed for `.map_err()` on stream types
+  - The forward URL is constructed as `{executor.endpoint}/chat/completions`
+---
+
 ## 2026-06-16 - US-002
 - What was implemented: Axum HTTP server setup with health endpoint tests, tracing initialization, and 404 test
 - Files changed:

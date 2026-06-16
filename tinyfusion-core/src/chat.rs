@@ -7,9 +7,30 @@
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use futures::stream::Stream;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::config::Config;
+use crate::proxy::forward_passthrough;
+
+/// Application state shared across all handlers.
+#[derive(Clone)]
+pub struct AppState {
+    pub config: Arc<Config>,
+    pub client: Client,
+}
+
+impl AppState {
+    pub fn new(config: Config) -> Self {
+        Self {
+            config: Arc::new(config),
+            client: Client::new(),
+        }
+    }
+}
 
 /// A single message in a chat completion request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,51 +284,64 @@ fn validate(raw: RawChatRequest) -> Result<ChatCompletionRequest, String> {
 /// For non-streaming requests, returns a standard JSON response.
 /// For streaming requests, returns an SSE stream with chunked events.
 pub(crate) async fn chat_completions(
+    axum::extract::State(state): axum::extract::State<AppState>,
     axum::Json(raw): axum::Json<RawChatRequest>,
 ) -> Result<ChatResponse, (StatusCode, axum::Json<serde_json::Value>)> {
-    match validate(raw) {
-        Ok(req) => {
-            tracing::info!(
-                "Chat completion request: model={}, messages={}, stream={}",
-                req.model,
-                req.messages.len(),
-                req.stream
-            );
-
-            if req.stream {
-                // Build a streaming response from the request content
-                // In US-006b we simulate by echoing user message content as chunks
-                let content: Vec<String> = req
-                    .messages
-                    .iter()
-                    .filter(|m| m.role == "user")
-                    .map(|m| m.content.clone())
-                    .collect();
-
-                let stream = build_sse_stream(&req.model, content);
-                Ok(ChatResponse::Stream(Sse::new(stream)))
-            } else {
-                // Build a non-streaming JSON response
-                // Use the last user message content for the assistant reply
-                let user_content = req
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|m| m.role == "user")
-                    .map(|m| m.content.as_str())
-                    .unwrap_or("");
-                let response = ChatCompletionResponse::new(&req.model, user_content);
-                Ok(ChatResponse::Json(axum::Json(response)))
-            }
-        }
+    let req = match validate(raw) {
+        Ok(r) => r,
         Err(msg) => {
             tracing::warn!("Invalid chat completion request: {}", msg);
-            Err((
+            return Err((
                 StatusCode::BAD_REQUEST,
                 axum::Json(serde_json::json!({
                     "error": {
                         "message": msg,
                         "type": "invalid_request_error"
+                    }
+                })),
+            ));
+        }
+    };
+
+    tracing::info!(
+        "Chat completion request: model={}, messages={}, stream={}",
+        req.model,
+        req.messages.len(),
+        req.stream
+    );
+
+    // Build the upstream URL: executor endpoint + /chat/completions
+    let upstream_url = format!("{}/chat/completions", state.config.executor.endpoint.trim_end_matches('/'));
+    let upstream_body = serde_json::json!({
+        "model": state.config.executor.model_id,
+        "messages": req.messages,
+        "stream": req.stream,
+    });
+
+    tracing::info!("Forwarding to upstream: {} → {}", req.model, upstream_url);
+
+    match forward_passthrough(&state.client, &upstream_url, &upstream_body).await {
+        Ok((status, headers, body)) => {
+            // Forward upstream response directly — preserve JSON or SSE format
+            let mut response = axum::response::Response::new(body);
+            *response.status_mut() = status;
+            // Copy Content-Type header if present
+            if let Some(ct) = headers.get("content-type") {
+                response.headers_mut().insert(
+                    "content-type",
+                    ct.clone(),
+                );
+            }
+            Ok(ChatResponse::Raw(response))
+        }
+        Err((status, error_msg)) => {
+            tracing::error!("Upstream forward failed: {}", error_msg);
+            Err((
+                status,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "message": error_msg,
+                        "type": "upstream_error"
                     }
                 })),
             ))
@@ -317,10 +351,11 @@ pub(crate) async fn chat_completions(
 
 /// Response type for the chat completions endpoint.
 ///
-/// Either a JSON response (non-streaming) or an SSE stream (streaming).
+/// Either a JSON response, an SSE stream, or a raw upstream passthrough.
 pub(crate) enum ChatResponse {
     Json(axum::Json<ChatCompletionResponse>),
     Stream(Sse<PinBoxStream>),
+    Raw(axum::response::Response),
 }
 
 pub(crate) type PinBoxStream = std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
@@ -330,6 +365,7 @@ impl axum::response::IntoResponse for ChatResponse {
         match self {
             ChatResponse::Json(json) => json.into_response(),
             ChatResponse::Stream(sse) => sse.into_response(),
+            ChatResponse::Raw(resp) => resp,
         }
     }
 }
@@ -340,12 +376,38 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Method, Request};
     use serde_json::json;
+    use std::collections::HashMap;
     use tower::ServiceExt;
 
-    /// Build a test router with the chat completions route.
+    use crate::config::ModelConfig;
+
+    fn test_state() -> AppState {
+        AppState {
+            config: Arc::new(Config {
+                port: 9999,
+                workers: vec![],
+                judge: ModelConfig {
+                    name: "judge".into(),
+                    endpoint: "http://localhost:11434".into(),
+                    model_id: "llama3".into(),
+                    api_key: None,
+                },
+                executor: ModelConfig {
+                    name: "executor".into(),
+                    endpoint: "http://localhost:11434".into(),
+                    model_id: "llama3".into(),
+                    api_key: None,
+                },
+                workspaces: HashMap::new(),
+            }),
+            client: Client::new(),
+        }
+    }
+
     fn chat_app() -> axum::Router {
         axum::Router::new()
             .route("/v1/chat/completions", axum::routing::post(chat_completions))
+            .with_state(test_state())
     }
 
     /// Helper: send a JSON POST and return the response.
@@ -370,223 +432,29 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    // -- Valid requests (non-streaming) --
+    // -- Passthrough forwarding --
 
     #[tokio::test]
-    async fn test_minimal_valid_request() {
+    async fn test_forward_attempts_upstream_connection() {
+        // Since no upstream is running, expect a BAD_GATEWAY or connection error
         let resp = post_json(json!({
             "model": "llama3",
             "messages": [{"role": "user", "content": "Hello"}]
         }))
         .await;
 
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = response_body(resp).await;
-        assert_eq!(body["object"], "chat.completion");
-        assert_eq!(body["model"], "llama3");
-        assert_eq!(body["choices"][0]["message"]["role"], "assistant");
-        assert_eq!(body["choices"][0]["finish_reason"], "stop");
-        assert!(body["usage"]["total_tokens"].as_u64().unwrap() > 0);
-    }
-
-    #[tokio::test]
-    async fn test_response_has_required_fields() {
-        let resp = post_json(json!({
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": "Test"}]
-        }))
-        .await;
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = response_body(resp).await;
-        // Required: id, object, created, model, choices, usage
-        assert!(body["id"].as_str().is_some(), "response must have 'id'");
-        assert_eq!(body["object"], "chat.completion");
-        assert!(body["created"].as_u64().is_some(), "response must have 'created'");
-        assert_eq!(body["model"], "gpt-4");
-        assert!(body["choices"].as_array().is_some(), "response must have 'choices'");
-        assert!(body["usage"].is_object(), "response must have 'usage'");
-    }
-
-    #[tokio::test]
-    async fn test_response_choice_structure() {
-        let resp = post_json(json!({
-            "model": "claude-3",
-            "messages": [{"role": "user", "content": "Hello world"}]
-        }))
-        .await;
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = response_body(resp).await;
-        let choice = &body["choices"][0];
-        assert_eq!(choice["index"], 0);
-        assert_eq!(choice["message"]["role"], "assistant");
-        assert_eq!(choice["message"]["content"], "Hello world");
-        assert_eq!(choice["finish_reason"], "stop");
-    }
-
-    #[tokio::test]
-    async fn test_response_usage_structure() {
-        let resp = post_json(json!({
-            "model": "llama3",
-            "messages": [{"role": "user", "content": "Test message"}]
-        }))
-        .await;
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = response_body(resp).await;
-        let usage = &body["usage"];
-        assert!(usage["prompt_tokens"].as_u64().is_some());
-        assert!(usage["completion_tokens"].as_u64().is_some());
-        assert!(usage["total_tokens"].as_u64().is_some());
-        assert_eq!(
-            usage["total_tokens"].as_u64().unwrap(),
-            usage["prompt_tokens"].as_u64().unwrap() + usage["completion_tokens"].as_u64().unwrap()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_response_id_format() {
-        let resp = post_json(json!({
-            "model": "llama3",
-            "messages": [{"role": "user", "content": "Hello"}]
-        }))
-        .await;
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = response_body(resp).await;
-        let id = body["id"].as_str().unwrap();
+        // Upstream should fail (no server at localhost:11434 for test default)
         assert!(
-            id.starts_with("chatcmpl-"),
-            "response id should start with 'chatcmpl-': {}",
-            id
+            resp.status() == StatusCode::BAD_GATEWAY || resp.status().is_server_error(),
+            "Expected upstream error status, got {}",
+            resp.status()
         );
-    }
-
-    #[tokio::test]
-    async fn test_valid_request_with_multiple_messages() {
-        let resp = post_json(json!({
-            "model": "claude-3",
-            "messages": [
-                {"role": "system", "content": "You are a coding assistant"},
-                {"role": "user", "content": "Fix this bug"},
-                {"role": "assistant", "content": "Here is the fix"}
-            ]
-        }))
-        .await;
-
-        assert_eq!(resp.status(), StatusCode::OK);
         let body = response_body(resp).await;
-        // Content should be from the last user message
-        assert_eq!(body["choices"][0]["message"]["content"], "Fix this bug");
+        assert!(body["error"]["message"].as_str().unwrap().contains("Upstream"));
+        assert_eq!(body["error"]["type"], "upstream_error");
     }
 
-    // -- Streaming requests --
-
-    #[tokio::test]
-    async fn test_streaming_response_returns_sse() {
-        let resp = post_json(json!({
-            "model": "llama3",
-            "messages": [{"role": "user", "content": "Hello"}],
-            "stream": true
-        }))
-        .await;
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        // SSE responses have Content-Type: text/event-stream
-        let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap();
-        assert!(
-            content_type.contains("text/event-stream"),
-            "streaming response should be SSE, got: {}",
-            content_type
-        );
-    }
-
-    #[tokio::test]
-    async fn test_streaming_response_contains_data_events() {
-        let resp = post_json(json!({
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": "Stream test"}],
-            "stream": true
-        }))
-        .await;
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = String::from_utf8_lossy(&body);
-        // Should contain SSE data: events
-        assert!(
-            text.contains("data:"),
-            "SSE response should contain 'data:' events"
-        );
-        assert!(
-            text.contains("chat.completion.chunk"),
-            "SSE response should contain chunk events"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_streaming_response_contains_done_marker() {
-        let resp = post_json(json!({
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": "Done test"}],
-            "stream": true
-        }))
-        .await;
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = String::from_utf8_lossy(&body);
-        assert!(
-            text.contains("[DONE]"),
-            "SSE response should contain [DONE] marker"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_streaming_response_has_finish_reason() {
-        let resp = post_json(json!({
-            "model": "llama3",
-            "messages": [{"role": "user", "content": "Finish test"}],
-            "stream": true
-        }))
-        .await;
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = String::from_utf8_lossy(&body);
-        assert!(
-            text.contains("stop"),
-            "SSE response should contain finish_reason 'stop'"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_streaming_chunk_structure() {
-        let resp = post_json(json!({
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "Struct test"}],
-            "stream": true
-        }))
-        .await;
-
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = String::from_utf8_lossy(&body);
-        // Each chunk should have id, object, created, model, choices
-        assert!(text.contains("\"object\":\"chat.completion.chunk\""));
-        assert!(text.contains("\"test-model\""));
-    }
-
-    // -- Non-streaming explicitly --
+    // -- Validation tests (request parsing, unchanged from US-006a) --
 
     // -- Missing required fields --
 
@@ -724,7 +592,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stream_defaults_to_false_returns_json() {
+    async fn test_stream_defaults_to_false_sends_to_upstream() {
         let resp = post_json(json!({
             "model": "llama3",
             "messages": [{"role": "user", "content": "Hello"}]
@@ -732,14 +600,14 @@ mod tests {
         }))
         .await;
 
-        assert_eq!(resp.status(), StatusCode::OK);
-        // Without stream=true, should return JSON (not SSE)
-        let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        // Without stream=true, still forwards to upstream.
+        // Upstream is unreachable → expect error, NOT a 200 JSON.
         assert!(
-            content_type.contains("json"),
-            "non-streaming response should be JSON, got: {}",
-            content_type
+            resp.status() == StatusCode::BAD_GATEWAY || resp.status().is_server_error(),
+            "Expected upstream error when no server running"
         );
+        let body = response_body(resp).await;
+        assert_eq!(body["error"]["type"], "upstream_error");
     }
 
     // -- Unit tests for validate function directly --

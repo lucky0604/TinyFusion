@@ -7,8 +7,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = Config::load_default()?;
-    let port = config.port;
 
-    server::run(port).await?;
+    server::run(config).await?;
     Ok(())
 }
