@@ -5,10 +5,15 @@ Started: 2026-06-16
 ## Codebase Patterns
 - TinyFusion is a Rust workspace with two crates: tinyfusion-core and tinyfusion-gui
 - Core uses Axum for HTTP server, Tokio for async runtime
-- GUI uses Tauri v2 with React frontend (to be added)
+- GUI uses Tauri v2 with React frontend
 - Design system follows refined developer console aesthetic (dark-first, Inter font, Lucide icons)
 - `tracing_subscriber::fmt().init()` must be called in main.rs for `info!`/`tracing` logs to appear on stdout
 - Use `tower::ServiceExt` with `axum::body::to_bytes` for unit testing routes without starting a real server
+- Frontend: Vite + React + TypeScript + Tailwind CSS v4 + React Router v7 + Lucide React
+- Tailwind v4: `@import "tailwindcss"` in CSS + `@tailwindcss/vite` plugin in vite.config.ts (no config.js needed)
+- Design system CSS variables defined in `frontend/src/index.css` — all components use `var(--token-name)`
+- `npx vite build` produces `dist/` which Tauri bundles via `frontendDist` in tauri.conf.json
+- Google Fonts @import must be the first rule in index.css
 
 ## 2026-06-16 - US-001
 - What was implemented: Rust workspace scaffolding with two crates (tinyfusion-core and tinyfusion-gui)
@@ -79,4 +84,34 @@ Started: 2026-06-16
 - **Learnings for future iterations:**
   - `cargo tauri build` is the correct verification for Tauri app shell (produces .app + .dmg on macOS)
   - App bundle structure: Contents/{Info.plist, MacOS/, Resources/}
+---
+
+## 2026-06-16 14:30 - US-005
+- What was implemented: Sidebar navigation with 4 route pages (Dashboard, Models, Logs, Settings) using React Router, design system CSS variables (dark/light theme tokens), Tailwind CSS v4 integration via Vite plugin, and app shell layout
+- Files changed:
+  - frontend/vite.config.ts (added @tailwindcss/vite plugin)
+  - frontend/index.html (updated title to "TinyFusion")
+  - frontend/src/index.css (complete rewrite: design system CSS variables from MASTER.md, Tailwind v4 import, global reset, focus ring, reduced motion)
+  - frontend/src/main.tsx (cleaned up unused imports)
+  - frontend/src/App.tsx (rewrote with BrowserRouter, Routes, AppShell wrapper)
+  - frontend/src/components/AppShell.tsx (new: flex layout with sidebar + main content area)
+  - frontend/src/components/Sidebar.tsx (new: 240px sidebar with logo, 4 nav items with Lucide icons, active/hover states, core status footer)
+  - frontend/src/pages/Dashboard.tsx (new: placeholder page)
+  - frontend/src/pages/Models.tsx (new: placeholder page)
+  - frontend/src/pages/Logs.tsx (new: placeholder page)
+  - frontend/src/pages/Settings.tsx (new: placeholder page)
+  - dist/ (rebuilt production assets)
+- Verification:
+  - TypeScript typecheck passes (`tsc -b --noEmit`)
+  - Vite build passes (11.5KB CSS, 238KB JS)
+  - Cargo tauri build passes (produces .app + .dmg)
+  - All 28 core Rust tests pass
+  - Sidebar implements design system §5.7 specs exactly (240px, 36px items, accent active state, border-left indicator, hover bg shift)
+- **Learnings for future iterations:**
+  - Design system CSS variables are defined in `frontend/src/index.css` — all components should use `var(--token-name)` references
+  - Tailwind v4 uses `@import "tailwindcss"` in CSS + `@tailwindcss/vite` plugin in vite.config.ts (no tailwind.config.js needed)
+  - Google Fonts @import must come before all other CSS rules — put it at the very top of index.css
+  - React Router v7 is installed (not v6) — API is identical for basic usage
+  - Lucide React components use `<IconName size={N} />` pattern with pixel sizes
+  - When modifying frontend, rebuild with `npx vite build` to update `dist/` for Tauri
 ---
