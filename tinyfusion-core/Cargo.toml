@@ -19,3 +19,4 @@ tokio-util = "0.7"
 futures = "0.3"
 async-stream = "0.3"
 tower-http = { version = "0.5", features = ["cors"] }
+tower = { version = "0.5", features = ["util"] }
