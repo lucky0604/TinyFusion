@@ -7,6 +7,8 @@ Started: 2026-06-16
 - Core uses Axum for HTTP server, Tokio for async runtime
 - GUI uses Tauri v2 with React frontend (to be added)
 - Design system follows refined developer console aesthetic (dark-first, Inter font, Lucide icons)
+- `tracing_subscriber::fmt().init()` must be called in main.rs for `info!`/`tracing` logs to appear on stdout
+- Use `tower::ServiceExt` with `axum::body::to_bytes` for unit testing routes without starting a real server
 
 ## 2026-06-16 - US-001
 - What was implemented: Rust workspace scaffolding with two crates (tinyfusion-core and tinyfusion-gui)
@@ -33,4 +35,16 @@ Started: 2026-06-16
   - Tauri v2 requires RGBA (not RGB) PNG icons, otherwise build fails
   - Tauri v2 capabilities directory must not exist if using auto-generated defaults
   - `cargo check` is the typecheck equivalent for Rust — must pass for all stories
+---
+
+## 2026-06-16 - US-002
+- What was implemented: Axum HTTP server setup with health endpoint tests, tracing initialization, and 404 test
+- Files changed:
+  - tinyfusion-core/src/server.rs (extracted `app()` builder for testability, added health check + 404 tests)
+  - tinyfusion-core/src/main.rs (added `tracing_subscriber::fmt().init()` for startup logs)
+  - tinyfusion-core/Cargo.toml (added `tower` dependency for route testing)
+- 22 tests pass (20 existing + 2 new server tests), cargo check passes
+- **Learnings for future iterations:**
+  - `tower::ServiceExt` allows testing axum routes without spawning a real server
+  - Server `app()` should be a separate public function so tests can construct it independently
 ---

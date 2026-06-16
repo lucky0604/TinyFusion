@@ -6,12 +6,12 @@ use axum::{
 use serde_json::json;
 use tracing::info;
 
-/// Run the Axum HTTP server on the configured address.
-pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// Run the Axum HTTP server on the configured address and port.
+pub async fn run(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let app = app();
 
-    let addr = "127.0.0.1:9999";
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let addr = format!("127.0.0.1:{}", port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
 
     info!("TinyFusion server listening on {}", addr);
 

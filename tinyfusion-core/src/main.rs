@@ -1,4 +1,4 @@
-use tinyfusion_core::server;
+use tinyfusion_core::{config::Config, server};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -6,6 +6,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_target(false)
         .init();
 
-    server::run().await?;
+    let config = Config::load_default()?;
+    let port = config.port;
+
+    server::run(port).await?;
     Ok(())
 }
