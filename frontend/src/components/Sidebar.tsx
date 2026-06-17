@@ -5,6 +5,7 @@ import {
   Cpu,
   ScrollText,
   Settings,
+  Activity,
   Sun,
   Moon,
 } from 'lucide-react'
@@ -17,6 +18,7 @@ interface NavItem {
 
 const navItems: NavItem[] = [
   { path: '/', label: 'Dashboard', icon: <LayoutDashboard size={16} /> },
+  { path: '/sessions', label: 'Sessions', icon: <Activity size={16} /> },
   { path: '/models', label: 'Models', icon: <Cpu size={16} /> },
   { path: '/logs', label: 'Logs', icon: <ScrollText size={16} /> },
   { path: '/settings', label: 'Settings', icon: <Settings size={16} /> },

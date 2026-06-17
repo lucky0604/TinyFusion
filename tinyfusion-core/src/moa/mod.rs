@@ -138,12 +138,29 @@ pub struct JudgeAnalysis {
 }
 
 pub fn parse_judge_xml(text: &str) -> JudgeAnalysis {
+    let consensus = extract_tag(text, "consensus");
+    let contradictions = extract_tag(text, "contradictions");
+    let coverage_gaps = extract_tag(text, "coverage_gaps");
+    let unique_insights = extract_tag(text, "unique_insights");
+    let final_plan = extract_tag(text, "final_plan");
+
+    let effective_final_plan = if final_plan.is_empty()
+        && consensus.is_empty()
+        && contradictions.is_empty()
+        && coverage_gaps.is_empty()
+        && unique_insights.is_empty()
+    {
+        text.trim().to_string()
+    } else {
+        final_plan
+    };
+
     JudgeAnalysis {
-        consensus: extract_tag(text, "consensus"),
-        contradictions: extract_tag(text, "contradictions"),
-        coverage_gaps: extract_tag(text, "coverage_gaps"),
-        unique_insights: extract_tag(text, "unique_insights"),
-        final_plan: extract_tag(text, "final_plan"),
+        consensus,
+        contradictions,
+        coverage_gaps,
+        unique_insights,
+        final_plan: effective_final_plan,
         raw: text.to_string(),
     }
 }
@@ -217,5 +234,26 @@ mod tests {
         assert_eq!(analysis.consensus, "Agreed");
         assert_eq!(analysis.final_plan, "Do it");
         assert_eq!(analysis.contradictions, "");
+    }
+
+    #[test]
+    fn test_xml_fallback_uses_raw_text_as_final_plan() {
+        let text = "The fix is to update auth.ts:47 and add a null check.";
+        let analysis = parse_judge_xml(text);
+        assert_eq!(analysis.consensus, "");
+        assert_eq!(analysis.contradictions, "");
+        assert_eq!(analysis.coverage_gaps, "");
+        assert_eq!(analysis.unique_insights, "");
+        assert_eq!(analysis.final_plan, text);
+        assert_eq!(analysis.raw, text);
+    }
+
+    #[test]
+    fn test_xml_fallback_no_false_positive_when_tags_present() {
+        let xml = "<consensus>Fix auth.ts</consensus><final_plan>Do it</final_plan>";
+        let analysis = parse_judge_xml(xml);
+        assert_eq!(analysis.consensus, "Fix auth.ts");
+        assert_eq!(analysis.final_plan, "Do it");
+        assert_ne!(analysis.final_plan, analysis.raw);
     }
 }

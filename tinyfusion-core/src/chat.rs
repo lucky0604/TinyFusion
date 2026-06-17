@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
+use crate::events::{EventBus, GatewayEvent};
 use crate::keepalive;
 use crate::moa::{self, WorkerConfig};
 use crate::proxy::forward_passthrough;
@@ -27,6 +28,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub client: Client,
     pub session_manager: Arc<SessionManager>,
+    pub events: Arc<EventBus>,
 }
 
 impl AppState {
@@ -35,6 +37,7 @@ impl AppState {
             config: Arc::new(config),
             client: Client::new(),
             session_manager: Arc::new(SessionManager::new()),
+            events: Arc::new(EventBus::new(256)),
         }
     }
 }
@@ -314,16 +317,23 @@ pub(crate) async fn chat_completions(
     let sniff_msgs: Vec<Message> =
         req.messages.iter().map(|m| m.clone()).collect();
 
-    let req_state = sniffer::sniff_state(&sniff_msgs);
+    let req_state = sniffer::sniff_state_with_keywords(&sniff_msgs, &state.config.error_keywords);
 
     let session_id = req.session_id.clone().unwrap_or_else(|| {
         Session::id_from_messages(&sniff_msgs)
     });
 
     let session_exists = state.session_manager.lookup(&session_id).is_some();
-    state
+    let (_, collision) = state
         .session_manager
         .get_or_create(session_id.clone(), sniff_msgs);
+
+    if collision {
+        tracing::warn!(
+            "Potential SHA-256 collision detected for session {} — proceeding with existing session state",
+            session_id
+        );
+    }
 
     let current = state
         .session_manager
@@ -339,16 +349,33 @@ pub(crate) async fn chat_completions(
         }
     };
 
-    let max_retries: u32 = 3; // TODO: read from config
+    let max_retries: u32 = state
+        .config
+        .workspaces
+        .get(req.workspace.as_deref().unwrap_or("default"))
+        .map(|w| w.max_retries)
+        .unwrap_or(3);
 
     match routing_state {
         SessionState::Diagnostic => {
+            state.events.emit(
+                GatewayEvent::new("phase", "Diagnostic phase started")
+                    .with_session(&session_id)
+            );
             handle_diagnostic(&state, &req, &session_id, max_retries).await
         }
         SessionState::Execution => {
+            state.events.emit(
+                GatewayEvent::new("phase", "Execution phase started")
+                    .with_session(&session_id)
+            );
             handle_execution(&state, &req, &session_id).await
         }
         SessionState::Verify => {
+            state.events.emit(
+                GatewayEvent::new("phase", "Verify phase started")
+                    .with_session(&session_id)
+            );
             handle_verify(&state, &req, &session_id).await
         }
         SessionState::Done => {
@@ -534,6 +561,7 @@ async fn handle_diagnostic(
                         &session_id,
                         SessionState::Execution,
                     );
+                    session_mgr.save_snapshot();
                 }
 
                 let done_event =
@@ -587,6 +615,7 @@ async fn handle_execution(
     match forward_passthrough(&state.client, &upstream_url, &upstream_body).await {
         Ok((status, headers, body)) => {
             state.session_manager.set_state(session_id, SessionState::Verify);
+            state.session_manager.save_snapshot();
 
             let mut response = axum::response::Response::new(body);
             *response.status_mut() = status;
@@ -634,7 +663,14 @@ async fn handle_verify(
         .map(|w| w.path.clone())
         .unwrap_or_else(|| ".".into());
 
-    let result = match crate::oracle::run_verify(&verify_cmd, &workspace_path, 45).await
+    let verify_timeout = state
+        .config
+        .workspaces
+        .get(workspace)
+        .map(|w| w.verify_timeout_seconds)
+        .unwrap_or(45);
+
+    let result = match crate::oracle::run_verify(&verify_cmd, &workspace_path, verify_timeout).await
     {
         Ok(r) => r,
         Err(e) => {
@@ -741,9 +777,11 @@ mod tests {
                     api_key: None,
                 },
                 workspaces: HashMap::new(),
+                error_keywords: vec![],
             }),
             client: Client::builder().timeout(std::time::Duration::from_secs(2)).build().unwrap(),
             session_manager: Arc::new(SessionManager::new()),
+            events: Arc::new(EventBus::new(256)),
         }
     }
 

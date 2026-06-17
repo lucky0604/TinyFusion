@@ -1,5 +1,6 @@
 pub mod chat;
 pub mod config;
+pub mod events;
 pub mod keepalive;
 pub mod moa;
 pub mod oracle;

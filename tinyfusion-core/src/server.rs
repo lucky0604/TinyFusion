@@ -1,4 +1,6 @@
 use axum::{
+    extract::State,
+    response::{sse::Sse, IntoResponse},
     routing::{get, post},
     Router,
     Json,
@@ -8,6 +10,7 @@ use tracing::info;
 
 use crate::chat::{self, AppState};
 use crate::config::Config;
+use crate::events;
 
 /// Run the Axum HTTP server on the configured address and port.
 pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -26,18 +29,92 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Health check endpoint: returns {"status": "ok"}
 async fn health_check() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok" }))
 }
 
-/// Build the application router with shared state.
+async fn get_config(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let config = &state.config;
+    let mut workspaces = serde_json::Map::new();
+    for (k, v) in &config.workspaces {
+        workspaces.insert(k.clone(), serde_json::json!({
+            "path": v.path,
+            "verify_command": v.verify_command,
+            "verify_timeout_seconds": v.verify_timeout_seconds,
+            "max_retries": v.max_retries,
+        }));
+    }
+    let workers: Vec<_> = config.workers.iter().map(|m| {
+        serde_json::json!({
+            "name": m.name,
+            "endpoint": m.endpoint,
+            "model_id": m.model_id,
+            "api_key": m.api_key,
+        })
+    }).collect();
+
+    Json(serde_json::json!({
+        "port": config.port,
+        "workers": workers,
+        "judge": {
+            "name": config.judge.name,
+            "endpoint": config.judge.endpoint,
+            "model_id": config.judge.model_id,
+            "api_key": config.judge.api_key,
+        },
+        "executor": {
+            "name": config.executor.name,
+            "endpoint": config.executor.endpoint,
+            "model_id": config.executor.model_id,
+            "api_key": config.executor.api_key,
+        },
+        "workspaces": workspaces,
+        "error_keywords": &config.error_keywords,
+    }))
+}
+
+async fn post_config(
+    _state: State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, (axum::http::StatusCode, Json<serde_json::Value>)> {
+    let path = Config::default_path();
+    let json_str = serde_json::to_string_pretty(&body).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": {"message": format!("Invalid JSON: {}", e), "type": "invalid_request"}})),
+        )
+    })?;
+    std::fs::write(&path, &json_str).map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": {"message": format!("Failed to write config: {}", e), "type": "config_error"}})),
+        )
+    })?;
+    info!("Config saved to {}", path.display());
+    Ok(Json(json!({"status": "ok", "message": "Config saved. Restart core to apply."})))
+}
+
+async fn events_handler(
+    State(state): State<AppState>,
+) -> Sse<impl futures::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>> {
+    let rx = state.events.subscribe();
+    events::event_stream(rx)
+}
+
 pub fn app(config: Config) -> Router {
     let state = AppState::new(config);
+    let loaded = state.session_manager.load_snapshot();
+    if loaded > 0 {
+        tracing::info!("Restored {} sessions from snapshot", loaded);
+    }
 
     Router::new()
         .route("/health", get(health_check))
         .route("/v1/chat/completions", post(chat::chat_completions))
+        .route("/v1/events", get(events_handler))
+        .route("/v1/config", get(get_config).post(post_config))
         .with_state(state)
 }
 
@@ -46,6 +123,7 @@ pub fn app(config: Config) -> Router {
 pub fn test_app() -> Router {
     use reqwest::Client;
     use crate::session::SessionManager;
+    use crate::events::EventBus;
     let state = AppState {
         config: std::sync::Arc::new(Config {
             port: 9999,
@@ -63,9 +141,11 @@ pub fn test_app() -> Router {
                 api_key: None,
             },
             workspaces: std::collections::HashMap::new(),
+            error_keywords: vec![],
         }),
         client: Client::new(),
         session_manager: std::sync::Arc::new(SessionManager::new()),
+        events: std::sync::Arc::new(EventBus::new(256)),
     };
     Router::new()
         .route("/health", get(health_check))

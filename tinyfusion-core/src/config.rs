@@ -14,11 +14,22 @@ pub struct ModelConfig {
     pub api_key: Option<String>,
 }
 
-/// Workspace entry: maps a workspace name to its path and verify command.
+/// Workspace entry: maps a workspace name to its path, verify command, and retry/timeout settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     pub path: String,
     pub verify_command: String,
+    #[serde(default = "default_verify_timeout")]
+    pub verify_timeout_seconds: u64,
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+}
+
+fn default_verify_timeout() -> u64 {
+    45
+}
+fn default_max_retries() -> u32 {
+    3
 }
 
 /// Top-level TinyFusion configuration loaded from ~/.tinyfusion/config.json.
@@ -29,6 +40,22 @@ pub struct Config {
     pub judge: ModelConfig,
     pub executor: ModelConfig,
     pub workspaces: HashMap<String, WorkspaceConfig>,
+    #[serde(default = "default_error_keywords")]
+    pub error_keywords: Vec<String>,
+}
+
+fn default_error_keywords() -> Vec<String> {
+    vec![
+        "stack trace".into(),
+        "compile error".into(),
+        "test failed".into(),
+        "stacktrace".into(),
+        "compilation error".into(),
+        "tests failed".into(),
+        "build failed".into(),
+        "assertion error".into(),
+        "panic".into(),
+    ]
 }
 
 impl Config {
@@ -63,6 +90,7 @@ impl Config {
                 api_key: None,
             },
             workspaces: HashMap::new(),
+            error_keywords: default_error_keywords(),
         }
     }
 
@@ -163,7 +191,9 @@ mod tests {
             "workspaces": {
                 "my-project": {
                     "path": "/home/user/project",
-                    "verify_command": "cargo test"
+                    "verify_command": "cargo test",
+                    "verify_timeout_seconds": 60,
+                    "max_retries": 5
                 }
             }
         });
@@ -182,6 +212,8 @@ mod tests {
             config.workspaces["my-project"].verify_command,
             "cargo test"
         );
+        assert_eq!(config.workspaces["my-project"].verify_timeout_seconds, 60);
+        assert_eq!(config.workspaces["my-project"].max_retries, 5);
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -268,5 +300,31 @@ mod tests {
         // Should end with .tinyfusion/config.json
         assert!(path.ends_with("config.json"));
         assert!(path.to_string_lossy().contains(".tinyfusion"));
+    }
+
+    #[test]
+    fn test_error_keywords_default() {
+        let default = Config::default_config();
+        assert!(default.error_keywords.contains(&"stack trace".into()));
+        assert!(default.error_keywords.contains(&"build failed".into()));
+        assert!(default.error_keywords.contains(&"panic".into()));
+        assert_eq!(default.error_keywords.len(), 9);
+    }
+
+    #[test]
+    fn test_error_keywords_custom() {
+        let json = serde_json::json!({
+            "port": 9999,
+            "workers": [],
+            "judge": {"name": "j", "endpoint": "http://localhost:11434", "model_id": "m"},
+            "executor": {"name": "e", "endpoint": "http://localhost:11434", "model_id": "m"},
+            "workspaces": {},
+            "error_keywords": ["segfault", "null pointer"]
+        });
+
+        let (path, dir) = write_config_temp(&json.to_string());
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.error_keywords, vec!["segfault", "null pointer"]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

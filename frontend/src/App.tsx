@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { AppShell } from './components/AppShell'
 import { Dashboard } from './pages/Dashboard'
+import { Sessions } from './pages/Sessions'
 import { Models } from './pages/Models'
 import { Logs } from './pages/Logs'
 import { Settings } from './pages/Settings'
@@ -11,6 +12,7 @@ function App() {
       <AppShell>
         <Routes>
           <Route path="/" element={<Dashboard />} />
+          <Route path="/sessions" element={<Sessions />} />
           <Route path="/models" element={<Models />} />
           <Route path="/logs" element={<Logs />} />
           <Route path="/settings" element={<Settings />} />

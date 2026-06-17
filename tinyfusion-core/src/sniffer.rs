@@ -14,40 +14,56 @@ pub enum RequestState {
 /// - Execution: messages contain </final_plan> tag
 /// - Default: Diagnostic
 pub fn sniff_state(messages: &[Message]) -> RequestState {
+    sniff_state_with_keywords(messages, &[])
+}
+
+/// Inspect messages using caller-provided error keywords (from config).
+pub fn sniff_state_with_keywords(
+    messages: &[Message],
+    error_keywords: &[String],
+) -> RequestState {
     if messages.is_empty() {
         return RequestState::Diagnostic;
     }
 
-    // Check for execution marker first (higher priority)
     for msg in messages {
         if msg.content.contains("</final_plan>") {
             return RequestState::Execution;
         }
     }
 
-    // Check for error keywords in the last message
     if let Some(last) = messages.last() {
         let lower = last.content.to_lowercase();
-        let error_keywords = [
-            "stack trace",
-            "compile error",
-            "test failed",
-            "stacktrace",
-            "compilation error",
-            "tests failed",
-        ];
-        if error_keywords.iter().any(|kw| lower.contains(kw)) {
+        let matches_keyword = error_keywords
+            .iter()
+            .any(|kw| lower.contains(&kw.to_lowercase()));
+        if matches_keyword {
+            return RequestState::Diagnostic;
+        }
+        let matches_default = DEFAULT_ERROR_KEYWORDS.iter().any(|kw| lower.contains(kw));
+        if matches_default {
             return RequestState::Diagnostic;
         }
     }
 
-    // Short conversations are diagnostic
     if messages.len() <= 2 {
         return RequestState::Diagnostic;
     }
 
     RequestState::Diagnostic
 }
+
+static DEFAULT_ERROR_KEYWORDS: &[&str] = &[
+    "stack trace",
+    "compile error",
+    "test failed",
+    "stacktrace",
+    "compilation error",
+    "tests failed",
+    "build failed",
+    "assertion error",
+    "panic",
+];
 
 use serde::{Deserialize, Serialize};
 
@@ -98,6 +114,50 @@ mod tests {
     fn test_compile_error_detection() {
         let messages = vec![
             Message { role: "user".into(), content: "compile error: cannot find value `x`".into() },
+        ];
+        assert_eq!(sniff_state(&messages), RequestState::Diagnostic);
+    }
+
+    #[test]
+    fn test_build_failed_detection() {
+        let messages = vec![
+            Message { role: "user".into(), content: "build failed with exit code 1".into() },
+        ];
+        assert_eq!(sniff_state(&messages), RequestState::Diagnostic);
+    }
+
+    #[test]
+    fn test_assertion_error_detection() {
+        let messages = vec![
+            Message { role: "user".into(), content: "assertion error: expected true, got false".into() },
+        ];
+        assert_eq!(sniff_state(&messages), RequestState::Diagnostic);
+    }
+
+    #[test]
+    fn test_panic_detection() {
+        let messages = vec![
+            Message { role: "user".into(), content: "thread 'main' panicked at src/main.rs:42".into() },
+        ];
+        assert_eq!(sniff_state(&messages), RequestState::Diagnostic);
+    }
+
+    #[test]
+    fn test_sniff_with_custom_keywords() {
+        let messages = vec![
+            Message { role: "user".into(), content: "segfault at address 0x0".into() },
+        ];
+        let custom_kw = vec!["segfault".into()];
+        assert_eq!(
+            sniff_state_with_keywords(&messages, &custom_kw),
+            RequestState::Diagnostic
+        );
+    }
+
+    #[test]
+    fn test_sniff_production_keyword_not_detected_without_custom() {
+        let messages = vec![
+            Message { role: "user".into(), content: "The production is running fine".into() },
         ];
         assert_eq!(sniff_state(&messages), RequestState::Diagnostic);
     }
