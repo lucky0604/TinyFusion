@@ -14,13 +14,19 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
+use crate::keepalive;
+use crate::moa::{self, WorkerConfig};
 use crate::proxy::forward_passthrough;
+use crate::session::{Session, SessionManager, SessionState};
+use crate::sniffer::{self, Message, RequestState};
+use tokio_util::sync::CancellationToken;
 
 /// Application state shared across all handlers.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
     pub client: Client,
+    pub session_manager: Arc<SessionManager>,
 }
 
 impl AppState {
@@ -28,23 +34,19 @@ impl AppState {
         Self {
             config: Arc::new(config),
             client: Client::new(),
+            session_manager: Arc::new(SessionManager::new()),
         }
     }
-}
-
-/// A single message in a chat completion request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
 }
 
 /// Parsed and validated chat completion request, ready for downstream handling.
 #[derive(Debug, Clone)]
 pub struct ChatCompletionRequest {
     pub model: String,
-    pub messages: Vec<ChatMessage>,
+    pub messages: Vec<Message>,
     pub stream: bool,
+    pub session_id: Option<String>,
+    pub workspace: Option<String>,
 }
 
 /// A single message in a chat completion response (assistant reply).
@@ -183,11 +185,7 @@ fn streaming_event(
         }],
     };
 
-    if finish_reason.is_some() {
-        Event::default().event("chat.completion.chunk").json_data(&chunk).unwrap()
-    } else {
-        Event::default().event("chat.completion.chunk").json_data(&chunk).unwrap()
-    }
+    Event::default().event("chat.completion.chunk").json_data(&chunk).unwrap()
 }
 
 /// Build a stream of SSE events from simulated content chunks.
@@ -230,9 +228,13 @@ pub(crate) struct RawChatRequest {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
-    messages: Option<Vec<ChatMessage>>,
+    messages: Option<Vec<Message>>,
     #[serde(default)]
     stream: Option<bool>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 /// Validate a raw request and return a structured [`ChatCompletionRequest`],
@@ -276,13 +278,12 @@ fn validate(raw: RawChatRequest) -> Result<ChatCompletionRequest, String> {
         model,
         messages,
         stream,
+        session_id: raw.session_id.clone(),
+        workspace: raw.workspace.clone(),
     })
 }
 
-/// Axum handler: parse and validate a chat completion request.
-///
-/// For non-streaming requests, returns a standard JSON response.
-/// For streaming requests, returns an SSE stream with chunked events.
+/// Axum handler: parse, validate, sniff state, and orchestrate the MoA pipeline.
 pub(crate) async fn chat_completions(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::Json(raw): axum::Json<RawChatRequest>,
@@ -304,38 +305,298 @@ pub(crate) async fn chat_completions(
     };
 
     tracing::info!(
-        "Chat completion request: model={}, messages={}, stream={}",
+        "Chat completion: model={}, messages={}, stream={}",
         req.model,
         req.messages.len(),
         req.stream
     );
 
-    // Build the upstream URL: executor endpoint + /chat/completions
-    let upstream_url = format!("{}/chat/completions", state.config.executor.endpoint.trim_end_matches('/'));
+    let sniff_msgs: Vec<Message> =
+        req.messages.iter().map(|m| m.clone()).collect();
+
+    let req_state = sniffer::sniff_state(&sniff_msgs);
+
+    let session_id = req.session_id.clone().unwrap_or_else(|| {
+        Session::id_from_messages(&sniff_msgs)
+    });
+
+    let session_exists = state.session_manager.lookup(&session_id).is_some();
+    state
+        .session_manager
+        .get_or_create(session_id.clone(), sniff_msgs);
+
+    let current = state
+        .session_manager
+        .lookup(&session_id)
+        .unwrap_or_else(|| Session::new(session_id.clone(), vec![]));
+
+    let routing_state = if session_exists {
+        current.state.clone()
+    } else {
+        match req_state {
+            RequestState::Execution => SessionState::Execution,
+            _ => SessionState::Diagnostic,
+        }
+    };
+
+    let max_retries: u32 = 3; // TODO: read from config
+
+    match routing_state {
+        SessionState::Diagnostic => {
+            handle_diagnostic(&state, &req, &session_id, max_retries).await
+        }
+        SessionState::Execution => {
+            handle_execution(&state, &req, &session_id).await
+        }
+        SessionState::Verify => {
+            handle_verify(&state, &req, &session_id).await
+        }
+        SessionState::Done => {
+            handle_execution(&state, &req, &session_id).await
+        }
+    }
+}
+
+/// Diagnostic phase: MoA worker fan-out → judge synthesis → SSE streaming with keepalive.
+async fn handle_diagnostic(
+    state: &AppState,
+    req: &ChatCompletionRequest,
+    session_id: &str,
+    _max_retries: u32,
+) -> Result<ChatResponse, (StatusCode, axum::Json<serde_json::Value>)> {
+    tracing::info!("[Diagnostic] session={}", session_id);
+
+    let worker_configs: Vec<WorkerConfig> = state
+        .config
+        .workers
+        .iter()
+        .map(|m| WorkerConfig {
+            endpoint: m.endpoint.clone(),
+            model_id: m.model_id.clone(),
+        })
+        .collect();
+
+    let worker_msgs: Vec<Message> =
+        req.messages.iter().map(|m| m.clone()).collect();
+    let worker_responses =
+        moa::call_workers(&worker_configs, &worker_msgs, 30).await;
+
+    let original_prompt = req
+        .messages
+        .iter()
+        .map(|m| format!("{}: {}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let judge_prompt = moa::build_judge_prompt(&original_prompt, &worker_responses);
+
+    let judge_config = &state.config.judge;
+    let judge_url =
+        format!("{}/chat/completions", judge_config.endpoint.trim_end_matches('/'));
+
+    let judge_body = serde_json::json!({
+        "model": judge_config.model_id,
+        "messages": [
+            {"role": "user", "content": judge_prompt}
+        ],
+        "stream": true,
+    });
+
+    let cancel = CancellationToken::new();
+    let keepalive_cancel = cancel.clone();
+    let keepalive = keepalive::keepalive_stream(keepalive_cancel);
+
+    let chat_id = generate_id();
+    let created = current_timestamp();
+
+    match state.client.post(&judge_url).json(&judge_body).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if !status.is_success() {
+                cancel.cancel();
+                let text = resp.text().await.unwrap_or_default();
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    axum::Json(serde_json::json!({
+                        "error": {
+                            "message": format!("Judge returned {}: {}", status.as_u16(), text),
+                            "type": "upstream_error"
+                        }
+                    })),
+                ));
+            }
+
+            use futures::StreamExt;
+            use tokio::sync::mpsc;
+
+            let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
+
+            let sse_id = chat_id.clone();
+            let sse_model = req.model.clone();
+            let session_id = session_id.to_string();
+            let session_mgr = state.session_manager.clone();
+            tokio::spawn(async move {
+                let mut stream = resp.bytes_stream();
+                let mut full_text = String::new();
+                let mut first_chunk = true;
+                let _ = cancel.cancel();
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            let text = String::from_utf8_lossy(&bytes);
+                            for line in text.lines() {
+                                let trimmed = line.trim();
+                                if trimmed.is_empty() {
+                                    continue;
+                                }
+                                if let Some(data) = trimmed.strip_prefix("data: ") {
+                                    if data == "[DONE]" {
+                                        let finish_event = Event::default()
+                                            .data("[DONE]");
+                                        let _ = tx
+                                            .send(Ok(finish_event))
+                                            .await;
+                                        break;
+                                    }
+                                    if let Ok(parsed) =
+                                        serde_json::from_str::<serde_json::Value>(data)
+                                    {
+                                        if let Some(choices) =
+                                            parsed["choices"].as_array()
+                                        {
+                                            for choice in choices {
+                                                if let Some(delta) =
+                                                    choice.get("delta")
+                                                {
+                                                    if let Some(content) =
+                                                        delta["content"].as_str()
+                                                    {
+                                                        full_text.push_str(content);
+                                                        if first_chunk {
+                                                            first_chunk = false;
+                                                            let start_event =
+                                                                streaming_event(
+                                                                    &sse_id,
+                                                                    created,
+                                                                    &sse_model,
+                                                                    Some(content),
+                                                                    0,
+                                                                    None,
+                                                                );
+                                                            let _ = tx
+                                                                .send(Ok(start_event))
+                                                                .await;
+                                                        } else {
+                                                            let delta_str = content.to_string();
+                                                            let delta_value = serde_json::json!({
+                                                                "id": sse_id,
+                                                                "object": "chat.completion.chunk",
+                                                                "created": created,
+                                                                "model": sse_model,
+                                                                "choices": [{
+                                                                    "index": 0,
+                                                                    "delta": {
+                                                                        "content": delta_str
+                                                                    },
+                                                                    "finish_reason": null
+                                                                }]
+                                                            });
+                                                            let evt = Event::default()
+                                                                .json_data(delta_value)
+                                                                .unwrap();
+                                                            let _ = tx
+                                                                .send(Ok(evt))
+                                                                .await;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+
+                let analysis = moa::parse_judge_xml(&full_text);
+                if !analysis.final_plan.is_empty() {
+                    let judge_msg = Message {
+                        role: "assistant".into(),
+                        content: full_text.clone(),
+                    };
+                    session_mgr.append_messages(
+                        &session_id,
+                        vec![judge_msg],
+                    );
+                    session_mgr.set_state(
+                        &session_id,
+                        SessionState::Execution,
+                    );
+                }
+
+                let done_event =
+                    Event::default().data("[DONE]");
+                let _ = tx.send(Ok(done_event)).await;
+            });
+
+            let rx_stream =
+                tokio_stream::wrappers::ReceiverStream::new(rx);
+
+            let merged = keepalive
+                .map(|e| {
+                    let evt: Result<Event, Infallible> = e;
+                    evt
+                })
+                .chain(rx_stream);
+
+            Ok(ChatResponse::Stream(Sse::new(Box::pin(merged))))
+        }
+        Err(e) => {
+            cancel.cancel();
+            Err((
+                StatusCode::BAD_GATEWAY,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Judge request failed: {}", e),
+                        "type": "upstream_error"
+                    }
+                })),
+            ))
+        }
+    }
+}
+
+/// Execution phase: forward request to executor via passthrough.
+async fn handle_execution(
+    state: &AppState,
+    req: &ChatCompletionRequest,
+    session_id: &str,
+) -> Result<ChatResponse, (StatusCode, axum::Json<serde_json::Value>)> {
+    tracing::info!("[Execution] session={}", session_id);
+
+    let upstream_url =
+        format!("{}/chat/completions", state.config.executor.endpoint.trim_end_matches('/'));
     let upstream_body = serde_json::json!({
         "model": state.config.executor.model_id,
         "messages": req.messages,
         "stream": req.stream,
     });
 
-    tracing::info!("Forwarding to upstream: {} → {}", req.model, upstream_url);
-
     match forward_passthrough(&state.client, &upstream_url, &upstream_body).await {
         Ok((status, headers, body)) => {
-            // Forward upstream response directly — preserve JSON or SSE format
+            state.session_manager.set_state(session_id, SessionState::Verify);
+
             let mut response = axum::response::Response::new(body);
             *response.status_mut() = status;
-            // Copy Content-Type header if present
             if let Some(ct) = headers.get("content-type") {
-                response.headers_mut().insert(
-                    "content-type",
-                    ct.clone(),
-                );
+                response.headers_mut().insert("content-type", ct.clone());
             }
             Ok(ChatResponse::Raw(response))
         }
         Err((status, error_msg)) => {
-            tracing::error!("Upstream forward failed: {}", error_msg);
+            tracing::error!("Executor forward failed: {}", error_msg);
             Err((
                 status,
                 axum::Json(serde_json::json!({
@@ -345,6 +606,86 @@ pub(crate) async fn chat_completions(
                     }
                 })),
             ))
+        }
+    }
+}
+
+/// Verify phase: run the oracle command and handle retry logic.
+async fn handle_verify(
+    state: &AppState,
+    req: &ChatCompletionRequest,
+    session_id: &str,
+) -> Result<ChatResponse, (StatusCode, axum::Json<serde_json::Value>)> {
+    tracing::info!("[Verify] session={}", session_id);
+
+    let workspace = req.workspace.as_deref().unwrap_or("default");
+
+    let verify_cmd = state
+        .config
+        .workspaces
+        .get(workspace)
+        .map(|w| w.verify_command.clone())
+        .unwrap_or_else(|| "echo 'No verify command configured'".into());
+
+    let workspace_path = state
+        .config
+        .workspaces
+        .get(workspace)
+        .map(|w| w.path.clone())
+        .unwrap_or_else(|| ".".into());
+
+    let result = match crate::oracle::run_verify(&verify_cmd, &workspace_path, 45).await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Verify command failed: {}", e),
+                        "type": "oracle_error"
+                    }
+                })),
+            ));
+        }
+    };
+
+    if result.is_success() {
+        state.session_manager.set_state(session_id, SessionState::Done);
+        Ok(ChatResponse::Json(axum::Json(
+            ChatCompletionResponse::new(&req.model, "Verification passed. Workflow complete."),
+        )))
+    } else {
+        let session = state.session_manager.lookup(session_id);
+        let retries = session.map(|s| s.retry_count).unwrap_or(0);
+        let max = 3;
+
+        if retries < max {
+            let error_msg = crate::oracle::format_error_message(&result);
+            let error_sniff = Message {
+                role: "user".into(),
+                content: error_msg,
+            };
+            state
+                .session_manager
+                .append_messages(session_id, vec![error_sniff]);
+            state
+                .session_manager
+                .set_state(session_id, SessionState::Diagnostic);
+            state.session_manager.increment_retry(session_id);
+
+            handle_diagnostic(state, req, session_id, max).await
+        } else {
+            state.session_manager.set_state(session_id, SessionState::Done);
+            Ok(ChatResponse::Json(axum::Json(
+                ChatCompletionResponse::new(
+                    &req.model,
+                    &format!(
+                        "Max retries ({}) reached. Last error:\n{}",
+                        max, result.stderr
+                    ),
+                ),
+            )))
         }
     }
 }
@@ -380,6 +721,7 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::config::ModelConfig;
+    use crate::session::SessionManager;
 
     fn test_state() -> AppState {
         AppState {
@@ -401,6 +743,7 @@ mod tests {
                 workspaces: HashMap::new(),
             }),
             client: Client::builder().timeout(std::time::Duration::from_secs(2)).build().unwrap(),
+            session_manager: Arc::new(SessionManager::new()),
         }
     }
 
@@ -436,10 +779,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_forward_attempts_upstream_connection() {
-        // Since no upstream is running, expect a BAD_GATEWAY or connection error
+        // Include </final_plan> to trigger Execution path (passthrough to executor)
         let resp = post_json(json!({
             "model": "llama3",
-            "messages": [{"role": "user", "content": "Hello"}]
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "system", "content": "You are helpful"},
+                {"role": "assistant", "content": "</final_plan> Do this"}
+            ]
         }))
         .await;
 
@@ -452,6 +799,24 @@ mod tests {
         let body = response_body(resp).await;
         assert!(body["error"]["message"].as_str().unwrap().contains("Upstream"));
         assert_eq!(body["error"]["type"], "upstream_error");
+    }
+
+    #[tokio::test]
+    async fn test_diagnostic_path_judge_error_without_endpoint() {
+        let resp = post_json(json!({
+            "model": "llama3",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .await;
+
+        // Diagnostic path tries judge which also fails without server
+        assert!(
+            resp.status() == StatusCode::BAD_GATEWAY || resp.status().is_server_error(),
+            "Expected upstream error status, got {}",
+            resp.status()
+        );
+        let body = response_body(resp).await;
+        assert!(body["error"]["message"].as_str().unwrap().contains("Judge"));
     }
 
     // -- Validation tests (request parsing, unchanged from US-006a) --
@@ -595,7 +960,11 @@ mod tests {
     async fn test_stream_defaults_to_false_sends_to_upstream() {
         let resp = post_json(json!({
             "model": "llama3",
-            "messages": [{"role": "user", "content": "Hello"}]
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "system", "content": "You are helpful"},
+                {"role": "assistant", "content": "</final_plan> Plan is ready"}
+            ]
             // no "stream" field at all
         }))
         .await;
@@ -616,11 +985,13 @@ mod tests {
     fn test_validate_returns_parsed_request() {
         let raw = RawChatRequest {
             model: Some("test-model".into()),
-            messages: Some(vec![ChatMessage {
+            messages: Some(vec![Message {
                 role: "user".into(),
                 content: "test".into(),
             }]),
             stream: Some(true),
+            session_id: None,
+            workspace: None,
         };
 
         let req = validate(raw).unwrap();
@@ -633,11 +1004,13 @@ mod tests {
     fn test_validate_descriptive_error_for_missing_model() {
         let raw = RawChatRequest {
             model: None,
-            messages: Some(vec![ChatMessage {
+            messages: Some(vec![Message {
                 role: "user".into(),
                 content: "test".into(),
             }]),
             stream: None,
+            session_id: None,
+            workspace: None,
         };
 
         let err = validate(raw).unwrap_err();
@@ -650,6 +1023,8 @@ mod tests {
             model: Some("model".into()),
             messages: None,
             stream: None,
+            session_id: None,
+            workspace: None,
         };
 
         let err = validate(raw).unwrap_err();

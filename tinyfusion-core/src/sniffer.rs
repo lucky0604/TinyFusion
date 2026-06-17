@@ -49,8 +49,10 @@ pub fn sniff_state(messages: &[Message]) -> RequestState {
     RequestState::Diagnostic
 }
 
+use serde::{Deserialize, Serialize};
+
 /// A single message in a chat completion request.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
     pub content: String,

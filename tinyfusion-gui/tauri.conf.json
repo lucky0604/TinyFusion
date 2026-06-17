@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "identifier": "com.tinyfusion.app",
   "build": {
-    "frontendDist": "../dist"
+    "frontendDist": "../frontend/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build --prefix ../frontend"
   },
   "app": {
     "withGlobalTauri": true,
@@ -16,7 +18,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://localhost:* https://localhost:*"
     }
   },
   "bundle": {

@@ -8,7 +8,6 @@ pub enum SessionState {
     Diagnostic,
     Execution,
     Verify,
-    Retry,
     Done,
 }
 
@@ -114,14 +113,6 @@ impl SessionManager {
             SessionState::Diagnostic => SessionState::Execution,
             SessionState::Execution => SessionState::Verify,
             SessionState::Verify => {
-                if session.retry_count < max_retries {
-                    session.retry_count += 1;
-                    SessionState::Diagnostic
-                } else {
-                    SessionState::Done
-                }
-            }
-            SessionState::Retry => {
                 if session.retry_count < max_retries {
                     session.retry_count += 1;
                     SessionState::Diagnostic

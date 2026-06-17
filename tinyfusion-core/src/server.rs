@@ -45,6 +45,7 @@ pub fn app(config: Config) -> Router {
 #[cfg(test)]
 pub fn test_app() -> Router {
     use reqwest::Client;
+    use crate::session::SessionManager;
     let state = AppState {
         config: std::sync::Arc::new(Config {
             port: 9999,
@@ -64,6 +65,7 @@ pub fn test_app() -> Router {
             workspaces: std::collections::HashMap::new(),
         }),
         client: Client::new(),
+        session_manager: std::sync::Arc::new(SessionManager::new()),
     };
     Router::new()
         .route("/health", get(health_check))

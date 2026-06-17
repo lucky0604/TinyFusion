@@ -1,0 +1,13 @@
+target/
+node_modules/
+dist/
+.cursor/
+.gstack/
+.opencode/
+.omo/
+agent_flow/
+tasks/
+scripts/ralph/pyproject.toml
+__pycache__/
+*.pyc
+.DS_Store
