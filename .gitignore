@@ -7,7 +7,7 @@ dist/
 .omo/
 agent_flow/
 tasks/
-scripts/ralph/pyproject.toml
+scripts/ralph/
 __pycache__/
 *.pyc
 .DS_Store

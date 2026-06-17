@@ -1,0 +1,12 @@
+{
+  "name": "tinyfusion",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "predev": "lsof -ti:5173 | xargs kill -9 2>/dev/null; true",
+    "dev": "concurrently -k -n vite,tauri -c blue,green \"cd frontend && npm run dev\" \"cd tinyfusion-gui && cargo tauri dev --no-dev-server\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
