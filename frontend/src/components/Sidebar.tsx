@@ -32,7 +32,7 @@ export function Sidebar() {
       aria-label="Main navigation"
     >
       {/* Logo */}
-      <div className="flex items-center gap-3 px-4" style={{ height: '48px' }}>
+      <div className="flex items-center gap-3" style={{ height: '48px', paddingLeft: '20px', paddingRight: '20px' }}>
         <div className="w-6 h-6 rounded-md bg-[var(--accent-primary)] flex items-center justify-center">
           <Cpu size={14} color="var(--text-inverse)" />
         </div>
@@ -42,7 +42,7 @@ export function Sidebar() {
       </div>
 
       {/* Nav items */}
-      <nav className="flex flex-col gap-1 px-2 mt-2">
+      <nav className="flex flex-col gap-1 mt-3">
         {navItems.map((item) => {
           const isActive = location.pathname === item.path
           return (
@@ -59,8 +59,8 @@ export function Sidebar() {
               `}
               style={{
                 height: '36px',
-                paddingLeft: isActive ? '14px' : '16px',
-                paddingRight: '16px',
+                paddingLeft: isActive ? '18px' : '20px',
+                paddingRight: '20px',
               }}
               aria-current={isActive ? 'page' : undefined}
             >
@@ -79,8 +79,8 @@ export function Sidebar() {
 
       {/* Core status */}
       <div
-        className="flex items-center gap-2 px-4 border-t border-[var(--border-subtle)]"
-        style={{ height: '48px' }}
+        className="flex items-center gap-2 border-t border-[var(--border-subtle)]"
+        style={{ height: '48px', paddingLeft: '20px', paddingRight: '20px' }}
         role="status"
         aria-label="Core running"
       >
@@ -110,8 +110,8 @@ function ThemeToggle() {
   return (
     <button
       onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-      className="flex items-center gap-3 px-4 cursor-pointer hover:bg-[var(--bg-hover)] transition-colors duration-[150ms] ease-out"
-      style={{ height: '36px' }}
+      className="flex items-center gap-3 cursor-pointer hover:bg-[var(--bg-hover)] transition-colors duration-[150ms] ease-out"
+      style={{ height: '36px', paddingLeft: '20px', paddingRight: '20px' }}
       aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
     >
       {theme === 'dark' ? <Sun size={16} className="text-[var(--text-secondary)]" /> : <Moon size={16} className="text-[var(--text-secondary)]" />}
