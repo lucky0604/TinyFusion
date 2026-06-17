@@ -400,7 +400,7 @@ mod tests {
                 },
                 workspaces: HashMap::new(),
             }),
-            client: Client::new(),
+            client: Client::builder().timeout(std::time::Duration::from_secs(2)).build().unwrap(),
         }
     }
 

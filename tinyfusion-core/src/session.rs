@@ -97,6 +97,44 @@ impl SessionManager {
             session.retry_count += 1;
         }
     }
+
+    /// Append messages to a session.
+    pub fn append_messages(&self, id: &str, new_messages: Vec<crate::sniffer::Message>) {
+        if let Some(session) = self.sessions.lock().unwrap().get_mut(id) {
+            session.messages.extend(new_messages);
+        }
+    }
+
+    /// Transition a session between states. Returns the new state on success.
+    pub fn transition(&self, id: &str, max_retries: u32) -> Option<SessionState> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.get_mut(id)?;
+
+        let new_state = match session.state {
+            SessionState::Diagnostic => SessionState::Execution,
+            SessionState::Execution => SessionState::Verify,
+            SessionState::Verify => {
+                if session.retry_count < max_retries {
+                    session.retry_count += 1;
+                    SessionState::Diagnostic
+                } else {
+                    SessionState::Done
+                }
+            }
+            SessionState::Retry => {
+                if session.retry_count < max_retries {
+                    session.retry_count += 1;
+                    SessionState::Diagnostic
+                } else {
+                    SessionState::Done
+                }
+            }
+            SessionState::Done => return None,
+        };
+
+        session.state = new_state.clone();
+        Some(new_state)
+    }
 }
 
 #[cfg(test)]
@@ -165,5 +203,84 @@ mod tests {
         manager.increment_retry(&id);
         let session = manager.lookup(&id).unwrap();
         assert_eq!(session.retry_count, 2);
+    }
+
+    #[test]
+    fn test_transition_diagnostic_to_execution() {
+        let manager = SessionManager::new();
+        let messages = test_messages();
+        let id = Session::id_from_messages(&messages);
+        manager.get_or_create(id.clone(), messages);
+
+        let new_state = manager.transition(&id, 3).unwrap();
+        assert_eq!(new_state, SessionState::Execution);
+        assert_eq!(manager.lookup(&id).unwrap().state, SessionState::Execution);
+    }
+
+    #[test]
+    fn test_transition_execution_to_verify() {
+        let manager = SessionManager::new();
+        let messages = test_messages();
+        let id = Session::id_from_messages(&messages);
+        manager.get_or_create(id.clone(), messages);
+
+        manager.set_state(&id, SessionState::Execution);
+        let new_state = manager.transition(&id, 3).unwrap();
+        assert_eq!(new_state, SessionState::Verify);
+    }
+
+    #[test]
+    fn test_transition_verify_to_done_on_success() {
+        let manager = SessionManager::new();
+        let messages = test_messages();
+        let id = Session::id_from_messages(&messages);
+        manager.get_or_create(id.clone(), messages);
+
+        manager.set_state(&id, SessionState::Verify);
+        // retry_count starts at 0, max_retries is 0 → should go to Done
+        let new_state = manager.transition(&id, 0).unwrap();
+        assert_eq!(new_state, SessionState::Done);
+    }
+
+    #[test]
+    fn test_transition_verify_to_diagnostic_on_retry() {
+        let manager = SessionManager::new();
+        let messages = test_messages();
+        let id = Session::id_from_messages(&messages);
+        manager.get_or_create(id.clone(), messages);
+
+        manager.set_state(&id, SessionState::Verify);
+        // retry_count 0 < max 3 → should retry to Diagnostic
+        let new_state = manager.transition(&id, 3).unwrap();
+        assert_eq!(new_state, SessionState::Diagnostic);
+        assert_eq!(manager.lookup(&id).unwrap().retry_count, 1);
+    }
+
+    #[test]
+    fn test_transition_done_returns_none() {
+        let manager = SessionManager::new();
+        let messages = test_messages();
+        let id = Session::id_from_messages(&messages);
+        manager.get_or_create(id.clone(), messages);
+
+        manager.set_state(&id, SessionState::Done);
+        let result = manager.transition(&id, 3);
+        assert!(result.is_none(), "Done state should not transition");
+    }
+
+    #[test]
+    fn test_transition_verify_to_done_when_max_retries_reached() {
+        let manager = SessionManager::new();
+        let messages = test_messages();
+        let id = Session::id_from_messages(&messages);
+        manager.get_or_create(id.clone(), messages);
+
+        manager.set_state(&id, SessionState::Verify);
+        manager.increment_retry(&id);
+        manager.increment_retry(&id);
+        manager.increment_retry(&id); // retry_count = 3, max = 3
+
+        let new_state = manager.transition(&id, 3).unwrap();
+        assert_eq!(new_state, SessionState::Done);
     }
 }

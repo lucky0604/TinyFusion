@@ -1,10 +1,12 @@
-import { type ReactNode } from 'react'
+import { type ReactNode, useState, useEffect } from 'react'
 import { Link, useLocation } from 'react-router-dom'
 import {
   LayoutDashboard,
   Cpu,
   ScrollText,
   Settings,
+  Sun,
+  Moon,
 } from 'lucide-react'
 
 interface NavItem {
@@ -72,6 +74,9 @@ export function Sidebar() {
       {/* Spacer */}
       <div className="flex-1" />
 
+      {/* Theme toggle */}
+      <ThemeToggle />
+
       {/* Core status */}
       <div
         className="flex items-center gap-2 px-4 border-t border-[var(--border-subtle)]"
@@ -86,5 +91,31 @@ export function Sidebar() {
         <span className="text-xs text-[var(--text-secondary)]">Running</span>
       </div>
     </aside>
+  )
+}
+
+function ThemeToggle() {
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    if (typeof window === 'undefined') return 'dark'
+    const saved = localStorage.getItem('theme')
+    if (saved === 'light' || saved === 'dark') return saved
+    return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark'
+  })
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    localStorage.setItem('theme', theme)
+  }, [theme])
+
+  return (
+    <button
+      onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+      className="flex items-center gap-3 px-4 cursor-pointer hover:bg-[var(--bg-hover)] transition-colors duration-[150ms] ease-out"
+      style={{ height: '36px' }}
+      aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+    >
+      {theme === 'dark' ? <Sun size={16} className="text-[var(--text-secondary)]" /> : <Moon size={16} className="text-[var(--text-secondary)]" />}
+      <span className="text-sm text-[var(--text-secondary)]">{theme === 'dark' ? 'Light Mode' : 'Dark Mode'}</span>
+    </button>
   )
 }
