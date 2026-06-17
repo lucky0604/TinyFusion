@@ -76,7 +76,9 @@ pub async fn forward_passthrough(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::routing::{get, post};
     use serde_json::json;
+    use std::net::SocketAddr;
 
     #[test]
     fn test_error_status_forward() {
@@ -116,5 +118,62 @@ mod tests {
         let url = "http://127.0.0.1:19999/chat/completions";
         let result = forward_passthrough(&client, url, &json!({"model":"t","messages":[]})).await;
         assert!(result.is_err(), "Expected error for refused connection");
+    }
+
+    struct MockServer {
+        addr: SocketAddr,
+    }
+
+    impl MockServer {
+        async fn start() -> Self {
+            let app = axum::Router::new()
+                .route("/health", get(|| async { "ok" }))
+                .route("/chat/completions", post(|| async {
+                    axum::response::Response::builder()
+                        .status(200)
+                        .header("content-type", "text/event-stream")
+                        .header("cache-control", "no-cache")
+                        .body(Body::from("data: {\"c\":\"hello\"}\n\ndata: [DONE]\n\n"))
+                        .unwrap()
+                }));
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+
+            let client = Client::builder().timeout(std::time::Duration::from_secs(2)).build().unwrap();
+            let health_url = format!("http://{}/health", addr);
+            for _ in 0..40 {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                if client.get(&health_url).send().await.map(|r| r.status().is_success()).unwrap_or(false) { break; }
+            }
+            MockServer { addr }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sse_passthrough_forwards_chunks() {
+        let server = MockServer::start().await;
+        let client = Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap();
+        let url = format!("http://{}/chat/completions", server.addr);
+        let (status, headers, body) = forward_passthrough(&client, &url, &json!({"model":"t","messages":[{"role":"user","content":"hi"}]})).await.expect("SSE passthrough should succeed");
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(headers.get("content-type").unwrap().to_str().unwrap().contains("text/event-stream"));
+        assert_eq!(headers.get("cache-control").unwrap().to_str().unwrap(), "no-cache");
+        let bytes = axum::body::to_bytes(body, 65536).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("\"c\":\"hello\""), "missing chunk: {}", text);
+        assert!(text.contains("[DONE]"), "missing done marker: {}", text);
+    }
+
+    #[tokio::test]
+    async fn test_sse_passthrough_stream_closes() {
+        let server = MockServer::start().await;
+        let client = Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap();
+        let url = format!("http://{}/chat/completions", server.addr);
+        let (_, _, body) = forward_passthrough(&client, &url, &json!({"model":"t","messages":[]})).await.expect("should succeed");
+        let bytes = axum::body::to_bytes(body, 65536).await.unwrap();
+        assert!(!bytes.is_empty(), "SSE body should not be empty");
     }
 }
