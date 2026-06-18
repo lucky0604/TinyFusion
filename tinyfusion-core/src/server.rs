@@ -17,8 +17,11 @@ pub async fn run(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let port = config.port;
     let app = app(config);
 
-    let addr = format!("127.0.0.1:{}", port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse()?;
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    let listener = socket.listen(1024)?;
 
     info!("TinyFusion server listening on {}", addr);
 

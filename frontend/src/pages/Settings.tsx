@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Plus, Trash2, Save, RotateCcw, Check } from 'lucide-react'
+import { Plus, Trash2, Save, Check } from 'lucide-react'
 
 interface WorkspaceConfig {
   path: string
@@ -28,17 +28,23 @@ function defaultConfig(): GlobalConfig {
   }
 }
 
+const tauriInvoke = (cmd: string, args?: Record<string, unknown>): Promise<any> => {
+  const t = (window as any).__TAURI__
+  const invoke = t?.core?.invoke || t?.invoke
+  return invoke ? invoke(cmd, args) : Promise.reject(new Error('Tauri API not available'))
+}
+
 export function Settings() {
   const [config, setConfig] = useState<GlobalConfig>(defaultConfig)
   const [saved, setSaved] = useState(false)
   const [newWsName, setNewWsName] = useState('')
   const [newWsPath, setNewWsPath] = useState('')
-  const [newWsCmd, setNewWsCmd] = useState('cargo build && cargo test')
+  const [newWsCmd] = useState('cargo build && cargo test')
 
   useEffect(() => {
     if (typeof window !== 'undefined' && (window as any).__TAURI__) {
-      ;(window as any).__TAURI__.invoke('get_config').then((c: GlobalConfig) => {
-        if (c) setConfig(c)
+      tauriInvoke('get_config').then((c: Partial<GlobalConfig>) => {
+        if (c) setConfig({ ...defaultConfig(), ...c })
       }).catch(() => {})
     }
   }, [])
@@ -46,8 +52,8 @@ export function Settings() {
   const save = async () => {
     if (typeof window !== 'undefined' && (window as any).__TAURI__) {
       try {
-        await (window as any).__TAURI__.invoke('save_config', { config })
-        await (window as any).__TAURI__.invoke('restart_core')
+        await tauriInvoke('save_config', { config })
+        await tauriInvoke('restart_core')
         setSaved(true)
         setTimeout(() => setSaved(false), 3000)
       } catch (e) {
@@ -223,3 +229,4 @@ export function Settings() {
     </div>
   )
 }
+

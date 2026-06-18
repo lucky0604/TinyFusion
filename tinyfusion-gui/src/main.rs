@@ -49,7 +49,31 @@ fn stop_core_inner(app: &tauri::AppHandle) {
     if let Some(state) = app.try_state::<Mutex<Option<tauri_plugin_shell::process::CommandChild>>>() {
         if let Ok(mut guard) = state.lock() {
             if let Some(child) = guard.take() {
+                let pid = child.pid();
+                eprintln!("[gui] stopping sidecar pid={}", pid);
                 let _ = child.kill();
+                // Poll with kill(pid,0) to confirm death. PID reuse within the
+                // 5 s window is theoretically possible but vanishingly unlikely on
+                // modern systems with PID randomization. If Tauri's CommandChild
+                // gains a wait() API, prefer that over raw PID polling.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                loop {
+                    #[cfg(unix)]
+                    {
+                        unsafe { if libc::kill(pid as i32, 0) != 0 { break; } }
+                    }
+                    #[cfg(not(unix))]
+                    break;
+                    if std::time::Instant::now() >= deadline {
+                        eprintln!("[gui] sidecar pid={} did not die, sending SIGKILL", pid);
+                        #[cfg(unix)]
+                        unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                eprintln!("[gui] sidecar pid={} stopped", pid);
             }
         }
     }
@@ -64,7 +88,7 @@ fn start_core_inner(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Er
     use std::sync::Mutex;
     app.manage(Mutex::new(Some(child)));
 
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         use tauri_plugin_shell::process::CommandEvent;
         while let Some(event) = rx.recv().await {
             match event {
