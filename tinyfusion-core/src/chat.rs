@@ -854,9 +854,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_diagnostic_path_judge_error_without_endpoint() {
+        // Messages with error keywords still route to Diagnostic
         let resp = post_json(json!({
             "model": "llama3",
-            "messages": [{"role": "user", "content": "Hello"}]
+            "messages": [{"role": "user", "content": "I got a compile error"}]
         }))
         .await;
 
@@ -868,6 +869,25 @@ mod tests {
         );
         let body = response_body(resp).await;
         assert!(body["error"]["message"].as_str().unwrap().contains("Judge"));
+    }
+
+    #[tokio::test]
+    async fn test_simple_message_routes_to_execution() {
+        // Simple chat without error keywords routes to Execution (fast path)
+        let resp = post_json(json!({
+            "model": "llama3",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .await;
+
+        // Execution path fails because no upstream server at localhost:11434
+        assert!(
+            resp.status() == StatusCode::BAD_GATEWAY || resp.status().is_server_error(),
+            "Expected upstream error status, got {}",
+            resp.status()
+        );
+        let body = response_body(resp).await;
+        assert!(body["error"]["message"].as_str().unwrap().contains("Upstream"));
     }
 
     // -- Validation tests (request parsing, unchanged from US-006a) --

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { Plus, Copy, Pencil, Trash2, Check, X, Eye, EyeOff } from 'lucide-react'
 
 type ModelProvider = 'ollama' | 'openai' | 'anthropic' | 'deepseek' | 'custom'
@@ -66,6 +66,88 @@ const PROVIDER_LABELS: Record<ModelProvider, string> = {
 
 function generateId() {
   return Math.random().toString(36).slice(2, 10)
+}
+
+const tauriInvoke = (cmd: string, args?: Record<string, unknown>): Promise<any> => {
+  const t = (window as any).__TAURI__
+  const invoke = t?.core?.invoke || t?.invoke
+  return invoke ? invoke(cmd, args) : Promise.reject(new Error('Tauri API not available'))
+}
+
+function inferProvider(endpoint: string): ModelProvider {
+  const ep = endpoint.toLowerCase()
+  if (ep.includes('localhost') || ep.includes('ollama') || ep.includes('11434')) return 'ollama'
+  if (ep.includes('openai')) return 'openai'
+  if (ep.includes('anthropic')) return 'anthropic'
+  if (ep.includes('deepseek')) return 'deepseek'
+  return 'custom'
+}
+
+function configToModels(config: any): ModelConfig[] {
+  const models: ModelConfig[] = []
+  if (Array.isArray(config.workers)) {
+    for (const w of config.workers) {
+      if (!w.endpoint || !w.model_id) continue
+      models.push({
+        id: generateId(),
+        name: w.name || '',
+        provider: inferProvider(w.endpoint),
+        endpoint: w.endpoint,
+        modelId: w.model_id,
+        apiKey: w.api_key || undefined,
+        role: 'workers',
+        status: 'untested',
+      })
+    }
+  }
+  if (config.judge?.endpoint && config.judge?.model_id) {
+    models.push({
+      id: generateId(),
+      name: config.judge.name || 'judge',
+      provider: inferProvider(config.judge.endpoint),
+      endpoint: config.judge.endpoint,
+      modelId: config.judge.model_id,
+      apiKey: config.judge.api_key || undefined,
+      role: 'judge',
+      status: 'untested',
+    })
+  }
+  if (config.executor?.endpoint && config.executor?.model_id) {
+    models.push({
+      id: generateId(),
+      name: config.executor.name || 'executor',
+      provider: inferProvider(config.executor.endpoint),
+      endpoint: config.executor.endpoint,
+      modelId: config.executor.model_id,
+      apiKey: config.executor.api_key || undefined,
+      role: 'executor',
+      status: 'untested',
+    })
+  }
+  return models
+}
+
+function modelsToConfig(models: ModelConfig[], baseConfig: any): any {
+  const workers = models.filter((m) => m.role === 'workers')
+  const judges = models.filter((m) => m.role === 'judge')
+  const executors = models.filter((m) => m.role === 'executor')
+  return {
+    port: baseConfig?.port ?? 9999,
+    workers: workers.map((w) => ({
+      name: w.name,
+      endpoint: w.endpoint,
+      model_id: w.modelId,
+      api_key: w.apiKey ?? null,
+    })),
+    judge: judges.length > 0
+      ? { name: judges[0].name, endpoint: judges[0].endpoint, model_id: judges[0].modelId, api_key: judges[0].apiKey ?? null }
+      : { name: 'judge', endpoint: 'http://localhost:11434', model_id: 'llama3', api_key: null },
+    executor: executors.length > 0
+      ? { name: executors[0].name, endpoint: executors[0].endpoint, model_id: executors[0].modelId, api_key: executors[0].apiKey ?? null }
+      : { name: 'executor', endpoint: 'http://localhost:11434', model_id: 'llama3', api_key: null },
+    workspaces: baseConfig?.workspaces ?? {},
+    error_keywords: baseConfig?.error_keywords ?? [],
+  }
 }
 
 function ModelStatusDot({ status }: { status: ConnectionStatus }) {
@@ -461,23 +543,9 @@ function RoleSection({
 }
 
 export function Models() {
-  const [models, setModels] = useState<ModelConfig[]>([
-    {
-      id: generateId(), name: 'qwen2.5-coder:7b', provider: 'ollama',
-      endpoint: 'http://localhost:11434/v1', modelId: 'qwen2.5-coder:7b',
-      role: 'workers', status: 'untested',
-    },
-    {
-      id: generateId(), name: 'claude-3-5-sonnet', provider: 'anthropic',
-      endpoint: 'https://api.anthropic.com/v1', modelId: 'claude-3-5-sonnet-20241022',
-      role: 'judge', status: 'untested',
-    },
-    {
-      id: generateId(), name: 'deepseek-chat', provider: 'deepseek',
-      endpoint: 'https://api.deepseek.com/v1', modelId: 'deepseek-chat',
-      role: 'executor', status: 'untested',
-    },
-  ])
+  const [models, setModels] = useState<ModelConfig[]>([])
+  const [fullConfig, setFullConfig] = useState<any>(null)
+  const [configLoaded, setConfigLoaded] = useState(false)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editingModel, setEditingModel] = useState<ModelConfig | null>(null)
   const [addingRole, setAddingRole] = useState<ModelRole>('workers')
@@ -486,6 +554,34 @@ export function Models() {
   })
   const [newWsPath, setNewWsPath] = useState('')
   const [newWsCmd, setNewWsCmd] = useState('')
+
+  // Load config from disk on mount
+  useEffect(() => {
+    if (typeof window !== 'undefined' && (window as any).__TAURI__) {
+      tauriInvoke('get_config').then((config: any) => {
+        setFullConfig(config)
+        setModels(configToModels(config))
+        setConfigLoaded(true)
+      }).catch(() => {
+        setConfigLoaded(true)
+      })
+    } else {
+      setConfigLoaded(true)
+    }
+  }, [])
+
+  // Persist models to config.json after every change
+  const persistModels = async (updatedModels: ModelConfig[]) => {
+    if (typeof window !== 'undefined' && (window as any).__TAURI__) {
+      try {
+        const merged = modelsToConfig(updatedModels, fullConfig)
+        await tauriInvoke('save_config', { config: merged })
+        setFullConfig(merged)
+      } catch (e) {
+        console.error('Failed to save model config:', e)
+      }
+    }
+  }
 
   const filteredRole = (role: ModelRole) => models.filter((m) => m.role === role)
 
@@ -501,16 +597,21 @@ export function Models() {
   }
 
   const handleSave = (model: ModelConfig) => {
+    let updated: ModelConfig[]
     if (editingModel) {
-      setModels(models.map((m) => (m.id === model.id ? model : m)))
+      updated = models.map((m) => (m.id === model.id ? model : m))
     } else {
-      setModels([...models, { ...model, role: addingRole }])
+      updated = [...models, { ...model, role: addingRole }]
     }
+    setModels(updated)
+    persistModels(updated)
   }
 
   const handleDelete = (model: ModelConfig) => {
     if (confirm(`Remove ${model.name}?`)) {
-      setModels(models.filter((m) => m.id !== model.id))
+      const updated = models.filter((m) => m.id !== model.id)
+      setModels(updated)
+      persistModels(updated)
     }
   }
 
@@ -555,6 +656,8 @@ export function Models() {
 
   return (
     <div style={{ padding: 24, maxWidth: 960 }}>
+      {!configLoaded ? null : (
+      <>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 24 }}>
         <h1 style={{ fontSize: '1.5rem', fontWeight: 600, color: 'var(--text-primary)' }}>
           Model Configuration
@@ -658,6 +761,8 @@ export function Models() {
         onSave={handleSave}
         onClose={() => setDialogOpen(false)}
       />
+      </>
+      )}
     </div>
   )
 }

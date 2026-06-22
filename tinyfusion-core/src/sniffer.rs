@@ -10,9 +10,9 @@ pub enum RequestState {
 /// Inspect the messages array of a chat completion request to determine state.
 ///
 /// Rules:
-/// - Diagnostic: message_count <= 2 OR last message contains error keywords
-/// - Execution: messages contain </final_plan> tag
-/// - Default: Diagnostic
+/// - Diagnostic: last message contains error keywords (or messages are empty)
+/// - Execution: messages contain </final_plan> tag, or no error keywords found
+/// - Default: Execution (simple chat goes to the fast executor path)
 pub fn sniff_state(messages: &[Message]) -> RequestState {
     sniff_state_with_keywords(messages, &[])
 }
@@ -46,11 +46,7 @@ pub fn sniff_state_with_keywords(
         }
     }
 
-    if messages.len() <= 2 {
-        return RequestState::Diagnostic;
-    }
-
-    RequestState::Diagnostic
+    RequestState::Execution
 }
 
 static DEFAULT_ERROR_KEYWORDS: &[&str] = &[
@@ -84,12 +80,12 @@ mod tests {
     }
 
     #[test]
-    fn test_short_conversation_is_diagnostic() {
+    fn test_short_conversation_without_errors_is_execution() {
         let messages = vec![
             Message { role: "system".into(), content: "You are helpful".into() },
             Message { role: "user".into(), content: "How do I fix this?".into() },
         ];
-        assert_eq!(sniff_state(&messages), RequestState::Diagnostic);
+        assert_eq!(sniff_state(&messages), RequestState::Execution);
     }
 
     #[test]
@@ -155,10 +151,10 @@ mod tests {
     }
 
     #[test]
-    fn test_sniff_production_keyword_not_detected_without_custom() {
+    fn test_no_error_keywords_routes_to_execution() {
         let messages = vec![
             Message { role: "user".into(), content: "The production is running fine".into() },
         ];
-        assert_eq!(sniff_state(&messages), RequestState::Diagnostic);
+        assert_eq!(sniff_state(&messages), RequestState::Execution);
     }
 }
