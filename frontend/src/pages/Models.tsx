@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Plus, Copy, Pencil, Trash2, Check, X, Eye, EyeOff } from 'lucide-react'
 
 type ModelProvider = 'ollama' | 'openai' | 'anthropic' | 'deepseek' | 'custom'
@@ -75,6 +75,12 @@ const tauriInvoke = (cmd: string, args?: Record<string, unknown>): Promise<any> 
 }
 
 function inferProvider(endpoint: string): ModelProvider {
+  try {
+    const host = new URL(endpoint).hostname
+    if (host === 'api.openai.com') return 'openai'
+    if (host === 'api.anthropic.com') return 'anthropic'
+    if (host === 'api.deepseek.com') return 'deepseek'
+  } catch { /* invalid URL, fall through to string matching */ }
   const ep = endpoint.toLowerCase()
   if (ep.includes('localhost') || ep.includes('ollama') || ep.includes('11434')) return 'ollama'
   if (ep.includes('openai')) return 'openai'
@@ -544,7 +550,7 @@ function RoleSection({
 
 export function Models() {
   const [models, setModels] = useState<ModelConfig[]>([])
-  const [fullConfig, setFullConfig] = useState<any>(null)
+  const fullConfig = useRef<any>(null)
   const [configLoaded, setConfigLoaded] = useState(false)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editingModel, setEditingModel] = useState<ModelConfig | null>(null)
@@ -559,7 +565,7 @@ export function Models() {
   useEffect(() => {
     if (typeof window !== 'undefined' && (window as any).__TAURI__) {
       tauriInvoke('get_config').then((config: any) => {
-        setFullConfig(config)
+        fullConfig.current = config
         setModels(configToModels(config))
         setConfigLoaded(true)
       }).catch(() => {
@@ -574,9 +580,9 @@ export function Models() {
   const persistModels = async (updatedModels: ModelConfig[]) => {
     if (typeof window !== 'undefined' && (window as any).__TAURI__) {
       try {
-        const merged = modelsToConfig(updatedModels, fullConfig)
+        const merged = modelsToConfig(updatedModels, fullConfig.current)
         await tauriInvoke('save_config', { config: merged })
-        setFullConfig(merged)
+        fullConfig.current = merged
       } catch (e) {
         console.error('Failed to save model config:', e)
       }
