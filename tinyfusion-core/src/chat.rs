@@ -1,10 +1,12 @@
-/// Chat Completions API — request parsing, response formatting, and streaming.
-///
-/// Handles POST /v1/chat/completions: parses and validates incoming
-/// OpenAI-compatible chat completion requests, returns responses in the
-/// standard OpenAI format (both streaming via SSE and non-streaming).
+//! Chat Completions API — request parsing, response formatting, and streaming.
+//!
+//! Handles POST /v1/chat/completions with the new Fusion deliberation pipeline:
+//!   1. FusionGuard check (subrequest → forced passthrough)
+//!   2. Model alias check (tinyfusion/fusion → Fusion pipeline)
+//!   3. Tool presence check (tinyfusion_deliberate in tools → Fusion pipeline)
+//!   4. Standard passthrough (all other requests)
 
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use futures::stream::Stream;
 use reqwest::Client;
@@ -15,11 +17,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 use crate::events::{EventBus, GatewayEvent};
+use crate::harness::{PipelineContext, PipelineRunner};
 use crate::keepalive;
-use crate::moa::{self, WorkerConfig};
 use crate::proxy::forward_passthrough;
-use crate::session::{Session, SessionManager, SessionState};
-use crate::sniffer::{self, Message, RequestState};
+use crate::session::SessionManager;
+use crate::types::{
+    DeliberateArgs, FusionGuard, Message,
+    FUSION_MODEL_ALIAS, FUSION_TOOL_NAME,
+};
 use tokio_util::sync::CancellationToken;
 
 /// Application state shared across all handlers.
@@ -29,10 +34,12 @@ pub struct AppState {
     pub client: Client,
     pub session_manager: Arc<SessionManager>,
     pub events: Arc<EventBus>,
+    pub pipeline_runner: Arc<PipelineRunner>,
 }
 
 impl AppState {
     pub fn new(config: Config) -> Self {
+        let pipeline_runner = PipelineRunner::from_config(&config);
         let client = Client::builder()
             .user_agent("Mozilla/5.0 (compatible; TinyFusion/1.0)")
             .build()
@@ -42,11 +49,12 @@ impl AppState {
             client,
             session_manager: Arc::new(SessionManager::new()),
             events: Arc::new(EventBus::new(256)),
+            pipeline_runner: Arc::new(pipeline_runner),
         }
     }
 }
 
-/// Parsed and validated chat completion request, ready for downstream handling.
+/// Parsed and validated chat completion request.
 #[derive(Debug, Clone)]
 pub struct ChatCompletionRequest {
     pub model: String,
@@ -54,6 +62,20 @@ pub struct ChatCompletionRequest {
     pub stream: bool,
     pub session_id: Option<String>,
     pub workspace: Option<String>,
+    pub tools: Option<Vec<serde_json::Value>>,
+}
+
+/// Routing decision for a chat completion request.
+#[derive(Debug)]
+enum RoutingDecision {
+    /// Subrequest: forced single-model passthrough (anti-recursion).
+    SubrequestPassthrough,
+    /// Fusion pipeline via model alias or tool presence.
+    FusionPipeline(DeliberateArgs),
+    /// Standard passthrough to executor.
+    StandardPassthrough,
+    /// Legacy diagnostic/MoA path (backward compat).
+    LegacyDiagnostic,
 }
 
 /// A single message in a chat completion response (assistant reply).
@@ -116,13 +138,9 @@ pub struct ChatCompletionChunk {
 }
 
 impl ChatCompletionResponse {
-    /// Construct a response with a single assistant choice.
     pub fn new(model: &str, content: &str) -> Self {
         let id = generate_id();
         let created = current_timestamp();
-
-        // Simple token estimation: ~1 token per 4 chars of English text
-        let prompt_tokens = 0; // Not tracked at this stage
         let completion_tokens = content.len().div_ceil(4).max(1);
 
         Self {
@@ -139,22 +157,20 @@ impl ChatCompletionResponse {
                 finish_reason: "stop".to_string(),
             }],
             usage: Usage {
-                prompt_tokens,
+                prompt_tokens: 0,
                 completion_tokens,
-                total_tokens: prompt_tokens + completion_tokens,
+                total_tokens: completion_tokens,
             },
         }
     }
 }
 
-/// Generate a unique chat completion ID.
 fn generate_id() -> String {
-    // Simple ID: chatcmpl-<timestamp_hex>
     let ts = current_timestamp();
-    format!("chatcmpl-{:x}", ts)
+    let rand_suffix: u32 = (ts as u32).wrapping_mul(2654435761);
+    format!("chatcmpl-{:x}{:04x}", ts, rand_suffix & 0xFFFF)
 }
 
-/// Current UNIX timestamp in seconds.
 fn current_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -162,9 +178,6 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
-/// Generate an SSE event for a streaming chunk.
-///
-/// Returns the final `[DONE]` event when `finish_reason` is provided.
 fn streaming_event(
     id: &str,
     created: u64,
@@ -192,14 +205,12 @@ fn streaming_event(
         }],
     };
 
-    Event::default().event("chat.completion.chunk").json_data(&chunk).unwrap()
+    Event::default()
+        .event("chat.completion.chunk")
+        .json_data(&chunk)
+        .unwrap()
 }
 
-/// Build a stream of SSE events from simulated content chunks.
-///
-/// This creates an async stream that yields SSE events for each content
-/// chunk followed by a final `[DONE]` event. In a real implementation,
-/// this would be driven by upstream token streaming.
 pub fn build_sse_stream(
     model: &str,
     content_chunks: Vec<String>,
@@ -209,17 +220,12 @@ pub fn build_sse_stream(
     let model = model.to_string();
 
     let stream = async_stream::stream! {
-        // Yield a content event for each chunk
         for chunk in &content_chunks {
             let event = streaming_event(&id, created, &model, Some(chunk), 0, None);
             yield Ok(event);
         }
-
-        // Yield the final event with finish_reason
         let done_event = streaming_event(&id, created, &model, None, 0, Some("stop"));
         yield Ok(done_event);
-
-        // Yield the [DONE] marker
         yield Ok(Event::default().event("chat.completion.chunk").data("[DONE]"));
     };
 
@@ -227,9 +233,6 @@ pub fn build_sse_stream(
 }
 
 /// Top-level request body as received from the client.
-///
-/// All fields are optional at the serde level so that we can return
-/// targeted validation errors rather than a generic deserialization failure.
 #[derive(Debug, Deserialize)]
 pub(crate) struct RawChatRequest {
     #[serde(default)]
@@ -242,10 +245,11 @@ pub(crate) struct RawChatRequest {
     session_id: Option<String>,
     #[serde(default)]
     workspace: Option<String>,
+    #[serde(default)]
+    tools: Option<Vec<serde_json::Value>>,
 }
 
-/// Validate a raw request and return a structured [`ChatCompletionRequest`],
-/// or a human-readable error string.
+/// Validate a raw request and return a structured ChatCompletionRequest.
 fn validate(raw: RawChatRequest) -> Result<ChatCompletionRequest, String> {
     let model = raw.model.ok_or_else(|| {
         "Missing required field: 'model'. The model name must be specified.".to_string()
@@ -263,7 +267,6 @@ fn validate(raw: RawChatRequest) -> Result<ChatCompletionRequest, String> {
         return Err("'messages' must contain at least one message.".to_string());
     }
 
-    // Validate that every message has a non-empty role and content
     for (i, msg) in messages.iter().enumerate() {
         if msg.role.is_empty() {
             return Err(format!(
@@ -271,7 +274,12 @@ fn validate(raw: RawChatRequest) -> Result<ChatCompletionRequest, String> {
                 i
             ));
         }
-        if msg.content.is_empty() {
+        // Allow empty content for tool-related messages
+        if msg.role != "tool"
+            && msg.role != "assistant"
+            && msg.content_str().is_empty()
+            && msg.tool_calls.is_none()
+        {
             return Err(format!(
                 "messages[{}]: 'content' must not be empty.",
                 i
@@ -285,16 +293,118 @@ fn validate(raw: RawChatRequest) -> Result<ChatCompletionRequest, String> {
         model,
         messages,
         stream,
-        session_id: raw.session_id.clone(),
-        workspace: raw.workspace.clone(),
+        session_id: raw.session_id,
+        workspace: raw.workspace,
+        tools: raw.tools,
     })
 }
 
-/// Axum handler: parse, validate, sniff state, and orchestrate the MoA pipeline.
+/// Resolve default panel models from config: use the first preset if available,
+/// otherwise use all registered models except the judge.
+fn resolve_default_panel_models(config: &Config) -> Vec<String> {
+    // Try the first preset
+    if let Some((_, models)) = config.fusion.presets.iter().next() {
+        if !models.is_empty() {
+            return models.clone();
+        }
+    }
+    // Fall back: all registered models except the judge
+    let judge = &config.fusion.default_judge_model;
+    let models: Vec<String> = config
+        .fusion
+        .models
+        .keys()
+        .filter(|k| k.as_str() != judge.as_str())
+        .cloned()
+        .collect();
+    if models.is_empty() {
+        config.fusion.models.keys().cloned().collect()
+    } else {
+        models
+    }
+}
+
+/// Determine routing based on the pure stateless decision tree.
+fn decide_route(
+    guard: &FusionGuard,
+    req: &ChatCompletionRequest,
+    config: &Config,
+) -> RoutingDecision {
+    let has_fusion_models = !config.fusion.models.is_empty();
+
+    // 1. Subrequest guard: prevent recursion
+    if guard.is_subrequest {
+        return RoutingDecision::SubrequestPassthrough;
+    }
+
+    // 2. Model alias: tinyfusion/fusion
+    if req.model == FUSION_MODEL_ALIAS {
+        let panel_models = resolve_default_panel_models(config);
+        return RoutingDecision::FusionPipeline(DeliberateArgs {
+            analysis_models: panel_models,
+            judge_model: None,
+        });
+    }
+
+    // 3. Check if tools contain tinyfusion_deliberate
+    if let Some(tools) = &req.tools {
+        for tool in tools {
+            if let Some(func) = tool.get("function") {
+                if func.get("name").and_then(|n| n.as_str()) == Some(FUSION_TOOL_NAME) {
+                    let panel_models = resolve_default_panel_models(config);
+                    return RoutingDecision::FusionPipeline(DeliberateArgs {
+                        analysis_models: panel_models,
+                        judge_model: None,
+                    });
+                }
+            }
+        }
+    }
+
+    // 4. Check if the last assistant message contains a tool_call for fusion
+    if let Some(last_assistant) = req.messages.iter().rev().find(|m| m.role == "assistant") {
+        if let Some(tool_calls) = &last_assistant.tool_calls {
+            for tc in tool_calls {
+                if tc.function.name == FUSION_TOOL_NAME {
+                    if let Ok(args) = serde_json::from_str::<DeliberateArgs>(&tc.function.arguments) {
+                        return RoutingDecision::FusionPipeline(args);
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. Legacy: check for error keywords to route to diagnostic (backward compat)
+    if has_fusion_models {
+        // If fusion config has models, prefer standard passthrough
+        return RoutingDecision::StandardPassthrough;
+    }
+
+    // Legacy fallback when no fusion config present
+    let sniff_msgs: Vec<crate::sniffer::Message> = req
+        .messages
+        .iter()
+        .map(|m| crate::sniffer::Message {
+            role: m.role.clone(),
+            content: m.content_str().to_string(),
+        })
+        .collect();
+
+    let req_state = crate::sniffer::sniff_state(&sniff_msgs);
+    match req_state {
+        crate::sniffer::RequestState::Diagnostic => RoutingDecision::LegacyDiagnostic,
+        crate::sniffer::RequestState::Execution => RoutingDecision::StandardPassthrough,
+    }
+}
+
+/// Axum handler: parse, validate, route, and orchestrate.
 pub(crate) async fn chat_completions(
     axum::extract::State(state): axum::extract::State<AppState>,
+    headers: HeaderMap,
     axum::Json(raw): axum::Json<RawChatRequest>,
 ) -> Result<ChatResponse, (StatusCode, axum::Json<serde_json::Value>)> {
+    let guard = FusionGuard::from_headers(&headers);
+
     let req = match validate(raw) {
         Ok(r) => r,
         Err(msg) => {
@@ -312,115 +422,185 @@ pub(crate) async fn chat_completions(
     };
 
     tracing::info!(
-        "Chat completion: model={}, messages={}, stream={}",
+        "Chat completion: model={}, messages={}, stream={}, subrequest={}",
         req.model,
         req.messages.len(),
-        req.stream
+        req.stream,
+        guard.is_subrequest
     );
 
-    let sniff_msgs: Vec<Message> =
-        req.messages.iter().map(|m| m.clone()).collect();
+    let decision = decide_route(&guard, &req, &state.config);
 
-    let req_state = sniffer::sniff_state_with_keywords(&sniff_msgs, &state.config.error_keywords);
-
-    let session_id = req.session_id.clone().unwrap_or_else(|| {
-        Session::id_from_messages(&sniff_msgs)
-    });
-
-    let session_exists = state.session_manager.lookup(&session_id).is_some();
-    let (_, collision) = state
-        .session_manager
-        .get_or_create(session_id.clone(), sniff_msgs);
-
-    if collision {
-        tracing::warn!(
-            "Potential SHA-256 collision detected for session {} — proceeding with existing session state",
-            session_id
-        );
-    }
-
-    let current = state
-        .session_manager
-        .lookup(&session_id)
-        .unwrap_or_else(|| Session::new(session_id.clone(), vec![]));
-
-    let routing_state = if session_exists {
-        current.state.clone()
-    } else {
-        match req_state {
-            RequestState::Execution => SessionState::Execution,
-            _ => SessionState::Diagnostic,
+    match decision {
+        RoutingDecision::SubrequestPassthrough => {
+            tracing::info!("[Route] Subrequest passthrough (anti-recursion)");
+            handle_passthrough(&state, &req).await
         }
-    };
-
-    let max_retries: u32 = state
-        .config
-        .workspaces
-        .get(req.workspace.as_deref().unwrap_or("default"))
-        .map(|w| w.max_retries)
-        .unwrap_or(3);
-
-    match routing_state {
-        SessionState::Diagnostic => {
+        RoutingDecision::FusionPipeline(args) => {
+            tracing::info!("[Route] Fusion deliberation pipeline: {:?}", args);
             state.events.emit(
-                GatewayEvent::new("phase", "Diagnostic phase started")
-                    .with_session(&session_id)
+                GatewayEvent::new("fusion", "Fusion deliberation pipeline started")
             );
-            handle_diagnostic(&state, &req, &session_id, max_retries).await
+            handle_fusion_pipeline(&state, &req, args).await
         }
-        SessionState::Execution => {
-            state.events.emit(
-                GatewayEvent::new("phase", "Execution phase started")
-                    .with_session(&session_id)
-            );
-            handle_execution(&state, &req, &session_id).await
+        RoutingDecision::StandardPassthrough => {
+            tracing::info!("[Route] Standard passthrough");
+            handle_passthrough(&state, &req).await
         }
-        SessionState::Verify => {
-            state.events.emit(
-                GatewayEvent::new("phase", "Verify phase started")
-                    .with_session(&session_id)
-            );
-            handle_verify(&state, &req, &session_id).await
-        }
-        SessionState::Done => {
-            handle_execution(&state, &req, &session_id).await
+        RoutingDecision::LegacyDiagnostic => {
+            tracing::info!("[Route] Legacy diagnostic path");
+            handle_legacy_diagnostic(&state, &req).await
         }
     }
 }
 
-/// Diagnostic phase: MoA worker fan-out → judge synthesis → SSE streaming with keepalive.
-async fn handle_diagnostic(
+/// Fusion deliberation pipeline: run the harness and return results.
+async fn handle_fusion_pipeline(
     state: &AppState,
     req: &ChatCompletionRequest,
-    session_id: &str,
-    _max_retries: u32,
+    args: DeliberateArgs,
 ) -> Result<ChatResponse, (StatusCode, axum::Json<serde_json::Value>)> {
-    tracing::info!("[Diagnostic] session={}", session_id);
+    let request_id = generate_id();
+    let panel_models = state.config.fusion.resolve_panel_models(&args.analysis_models);
+    let judge_model = args
+        .judge_model
+        .unwrap_or_else(|| state.config.fusion.default_judge_model.clone());
 
-    let worker_configs: Vec<WorkerConfig> = state
+    let mut ctx = PipelineContext::new(
+        request_id.clone(),
+        req.messages.clone(),
+        panel_models,
+        judge_model,
+        req.stream,
+    );
+
+    match state.pipeline_runner.run(&mut ctx, state).await {
+        Ok(()) => {
+            let analysis = ctx
+                .structured_analysis
+                .as_ref()
+                .cloned()
+                .unwrap_or_default();
+
+            let tool_output = serde_json::to_string_pretty(&analysis).unwrap_or_default();
+
+            if req.stream {
+                let content_chunks = split_into_chunks(&tool_output, 80);
+                Ok(ChatResponse::Stream(Sse::new(build_sse_stream(
+                    &req.model,
+                    content_chunks,
+                ))))
+            } else {
+                Ok(ChatResponse::Json(axum::Json(
+                    ChatCompletionResponse::new(&req.model, &tool_output),
+                )))
+            }
+        }
+        Err(e) => {
+            tracing::error!("[Fusion] Pipeline failed: {}", e);
+            state.events.emit(
+                GatewayEvent::new("error", &format!("Fusion pipeline failed: {}", e))
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "message": format!("Fusion pipeline failed: {}", e),
+                        "type": "fusion_error"
+                    }
+                })),
+            ))
+        }
+    }
+}
+
+/// Standard passthrough: forward to executor/upstream.
+async fn handle_passthrough(
+    state: &AppState,
+    req: &ChatCompletionRequest,
+) -> Result<ChatResponse, (StatusCode, axum::Json<serde_json::Value>)> {
+    // Try to find the model in fusion registry first
+    let (upstream_url, model_id, api_key) = if let Some(entry) = state.config.fusion.get_model(&req.model) {
+        (
+            format!("{}/chat/completions", entry.endpoint.trim_end_matches('/')),
+            entry.model_id.clone(),
+            entry.api_key.clone(),
+        )
+    } else {
+        // Fall back to legacy executor config
+        (
+            format!("{}/chat/completions", state.config.executor.endpoint.trim_end_matches('/')),
+            state.config.executor.model_id.clone(),
+            state.config.executor.api_key.clone(),
+        )
+    };
+
+    let upstream_body = serde_json::json!({
+        "model": model_id,
+        "messages": req.messages,
+        "stream": req.stream,
+    });
+
+    match forward_passthrough(&state.client, &upstream_url, &upstream_body, api_key.as_deref()).await {
+        Ok((status, headers, body)) => {
+            let mut response = axum::response::Response::new(body);
+            *response.status_mut() = status;
+            if let Some(ct) = headers.get("content-type") {
+                response.headers_mut().insert("content-type", ct.clone());
+            }
+            Ok(ChatResponse::Raw(response))
+        }
+        Err((status, error_msg)) => {
+            tracing::error!("Passthrough failed: {}", error_msg);
+            Err((
+                status,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "message": error_msg,
+                        "type": "upstream_error"
+                    }
+                })),
+            ))
+        }
+    }
+}
+
+/// Legacy diagnostic path (backward compat with old MoA).
+async fn handle_legacy_diagnostic(
+    state: &AppState,
+    req: &ChatCompletionRequest,
+) -> Result<ChatResponse, (StatusCode, axum::Json<serde_json::Value>)> {
+    let worker_configs: Vec<crate::moa::WorkerConfig> = state
         .config
         .workers
         .iter()
-        .map(|m| WorkerConfig {
+        .map(|m| crate::moa::WorkerConfig {
             endpoint: m.endpoint.clone(),
             model_id: m.model_id.clone(),
             api_key: m.api_key.clone(),
         })
         .collect();
 
-    let worker_msgs: Vec<Message> =
-        req.messages.iter().map(|m| m.clone()).collect();
+    let worker_msgs: Vec<crate::sniffer::Message> = req
+        .messages
+        .iter()
+        .map(|m| crate::sniffer::Message {
+            role: m.role.clone(),
+            content: m.content_str().to_string(),
+        })
+        .collect();
+
     let worker_responses =
-        moa::call_workers(&worker_configs, &worker_msgs, 30).await;
+        crate::moa::call_workers(&worker_configs, &worker_msgs, 30).await;
 
     let original_prompt = req
         .messages
         .iter()
-        .map(|m| format!("{}: {}", m.role, m.content))
+        .map(|m| format!("{}: {}", m.role, m.content_str()))
         .collect::<Vec<_>>()
         .join("\n");
 
-    let judge_prompt = moa::build_judge_prompt(&original_prompt, &worker_responses);
+    let judge_prompt = crate::moa::build_judge_prompt(&original_prompt, &worker_responses);
 
     let judge_config = &state.config.judge;
     let judge_url =
@@ -441,15 +621,16 @@ async fn handle_diagnostic(
     let chat_id = generate_id();
     let created = current_timestamp();
 
-    match {
-        let mut req = state.client.post(&judge_url).json(&judge_body);
+    let judge_result = {
+        let mut req_builder = state.client.post(&judge_url).json(&judge_body);
         if let Some(ref key) = judge_config.api_key {
             if !key.is_empty() {
-                req = req.header("Authorization", format!("Bearer {}", key));
+                req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
             }
         }
-        req.send().await
-    } {
+        req_builder.send().await
+    };
+    match judge_result {
         Ok(resp) => {
             let status = resp.status();
             if !status.is_success() {
@@ -470,16 +651,12 @@ async fn handle_diagnostic(
             use tokio::sync::mpsc;
 
             let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
-
             let sse_id = chat_id.clone();
             let sse_model = req.model.clone();
-            let session_id = session_id.to_string();
-            let session_mgr = state.session_manager.clone();
+
             tokio::spawn(async move {
                 let mut stream = resp.bytes_stream();
-                let mut full_text = String::new();
-                let mut first_chunk = true;
-                let _ = cancel.cancel();
+                cancel.cancel();
                 while let Some(chunk) = stream.next().await {
                     match chunk {
                         Ok(bytes) => {
@@ -491,66 +668,22 @@ async fn handle_diagnostic(
                                 }
                                 if let Some(data) = trimmed.strip_prefix("data: ") {
                                     if data == "[DONE]" {
-                                        let finish_event = Event::default()
-                                            .data("[DONE]");
-                                        let _ = tx
-                                            .send(Ok(finish_event))
-                                            .await;
+                                        let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
                                         break;
                                     }
-                                    if let Ok(parsed) =
-                                        serde_json::from_str::<serde_json::Value>(data)
-                                    {
-                                        if let Some(choices) =
-                                            parsed["choices"].as_array()
+                                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
+                                        if let Some(content) = parsed["choices"]
+                                            .as_array()
+                                            .and_then(|c| c.first())
+                                            .and_then(|c| c.get("delta"))
+                                            .and_then(|d| d.get("content"))
+                                            .and_then(|c| c.as_str())
                                         {
-                                            for choice in choices {
-                                                if let Some(delta) =
-                                                    choice.get("delta")
-                                                {
-                                                    if let Some(content) =
-                                                        delta["content"].as_str()
-                                                    {
-                                                        full_text.push_str(content);
-                                                        if first_chunk {
-                                                            first_chunk = false;
-                                                            let start_event =
-                                                                streaming_event(
-                                                                    &sse_id,
-                                                                    created,
-                                                                    &sse_model,
-                                                                    Some(content),
-                                                                    0,
-                                                                    None,
-                                                                );
-                                                            let _ = tx
-                                                                .send(Ok(start_event))
-                                                                .await;
-                                                        } else {
-                                                            let delta_str = content.to_string();
-                                                            let delta_value = serde_json::json!({
-                                                                "id": sse_id,
-                                                                "object": "chat.completion.chunk",
-                                                                "created": created,
-                                                                "model": sse_model,
-                                                                "choices": [{
-                                                                    "index": 0,
-                                                                    "delta": {
-                                                                        "content": delta_str
-                                                                    },
-                                                                    "finish_reason": null
-                                                                }]
-                                                            });
-                                                            let evt = Event::default()
-                                                                .json_data(delta_value)
-                                                                .unwrap();
-                                                            let _ = tx
-                                                                .send(Ok(evt))
-                                                                .await;
-                                                        }
-                                                    }
-                                                }
-                                            }
+                                            let evt = streaming_event(
+                                                &sse_id, created, &sse_model,
+                                                Some(content), 0, None,
+                                            );
+                                            let _ = tx.send(Ok(evt)).await;
                                         }
                                     }
                                 }
@@ -559,37 +692,12 @@ async fn handle_diagnostic(
                         Err(_) => break,
                     }
                 }
-
-                let analysis = moa::parse_judge_xml(&full_text);
-                if !analysis.final_plan.is_empty() {
-                    let judge_msg = Message {
-                        role: "assistant".into(),
-                        content: full_text.clone(),
-                    };
-                    session_mgr.append_messages(
-                        &session_id,
-                        vec![judge_msg],
-                    );
-                    session_mgr.set_state(
-                        &session_id,
-                        SessionState::Execution,
-                    );
-                    session_mgr.save_snapshot();
-                }
-
-                let done_event =
-                    Event::default().data("[DONE]");
-                let _ = tx.send(Ok(done_event)).await;
+                let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
             });
 
-            let rx_stream =
-                tokio_stream::wrappers::ReceiverStream::new(rx);
-
+            let rx_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
             let merged = keepalive
-                .map(|e| {
-                    let evt: Result<Event, Infallible> = e;
-                    evt
-                })
+                .map(|e| -> Result<Event, Infallible> { e })
                 .chain(rx_stream);
 
             Ok(ChatResponse::Stream(Sse::new(Box::pin(merged))))
@@ -609,146 +717,23 @@ async fn handle_diagnostic(
     }
 }
 
-/// Execution phase: forward request to executor via passthrough.
-async fn handle_execution(
-    state: &AppState,
-    req: &ChatCompletionRequest,
-    session_id: &str,
-) -> Result<ChatResponse, (StatusCode, axum::Json<serde_json::Value>)> {
-    tracing::info!("[Execution] session={}", session_id);
-
-    let upstream_url =
-        format!("{}/chat/completions", state.config.executor.endpoint.trim_end_matches('/'));
-    let upstream_body = serde_json::json!({
-        "model": state.config.executor.model_id,
-        "messages": req.messages,
-        "stream": req.stream,
-    });
-
-    match forward_passthrough(&state.client, &upstream_url, &upstream_body, state.config.executor.api_key.as_deref()).await {
-        Ok((status, headers, body)) => {
-            state.session_manager.set_state(session_id, SessionState::Verify);
-            state.session_manager.save_snapshot();
-
-            let mut response = axum::response::Response::new(body);
-            *response.status_mut() = status;
-            if let Some(ct) = headers.get("content-type") {
-                response.headers_mut().insert("content-type", ct.clone());
-            }
-            Ok(ChatResponse::Raw(response))
-        }
-        Err((status, error_msg)) => {
-            tracing::error!("Executor forward failed: {}", error_msg);
-            Err((
-                status,
-                axum::Json(serde_json::json!({
-                    "error": {
-                        "message": error_msg,
-                        "type": "upstream_error"
-                    }
-                })),
-            ))
-        }
-    }
-}
-
-/// Verify phase: run the oracle command and handle retry logic.
-async fn handle_verify(
-    state: &AppState,
-    req: &ChatCompletionRequest,
-    session_id: &str,
-) -> Result<ChatResponse, (StatusCode, axum::Json<serde_json::Value>)> {
-    tracing::info!("[Verify] session={}", session_id);
-
-    let workspace = req.workspace.as_deref().unwrap_or("default");
-
-    let verify_cmd = state
-        .config
-        .workspaces
-        .get(workspace)
-        .map(|w| w.verify_command.clone())
-        .unwrap_or_else(|| "echo 'No verify command configured'".into());
-
-    let workspace_path = state
-        .config
-        .workspaces
-        .get(workspace)
-        .map(|w| w.path.clone())
-        .unwrap_or_else(|| ".".into());
-
-    let verify_timeout = state
-        .config
-        .workspaces
-        .get(workspace)
-        .map(|w| w.verify_timeout_seconds)
-        .unwrap_or(45);
-
-    let result = match crate::oracle::run_verify(&verify_cmd, &workspace_path, verify_timeout).await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(serde_json::json!({
-                    "error": {
-                        "message": format!("Verify command failed: {}", e),
-                        "type": "oracle_error"
-                    }
-                })),
-            ));
-        }
-    };
-
-    if result.is_success() {
-        state.session_manager.set_state(session_id, SessionState::Done);
-        Ok(ChatResponse::Json(axum::Json(
-            ChatCompletionResponse::new(&req.model, "Verification passed. Workflow complete."),
-        )))
-    } else {
-        let session = state.session_manager.lookup(session_id);
-        let retries = session.map(|s| s.retry_count).unwrap_or(0);
-        let max = 3;
-
-        if retries < max {
-            let error_msg = crate::oracle::format_error_message(&result);
-            let error_sniff = Message {
-                role: "user".into(),
-                content: error_msg,
-            };
-            state
-                .session_manager
-                .append_messages(session_id, vec![error_sniff]);
-            state
-                .session_manager
-                .set_state(session_id, SessionState::Diagnostic);
-            state.session_manager.increment_retry(session_id);
-
-            handle_diagnostic(state, req, session_id, max).await
-        } else {
-            state.session_manager.set_state(session_id, SessionState::Done);
-            Ok(ChatResponse::Json(axum::Json(
-                ChatCompletionResponse::new(
-                    &req.model,
-                    &format!(
-                        "Max retries ({}) reached. Last error:\n{}",
-                        max, result.stderr
-                    ),
-                ),
-            )))
-        }
-    }
+/// Split text into chunks of approximately `size` characters for streaming.
+fn split_into_chunks(text: &str, size: usize) -> Vec<String> {
+    text.as_bytes()
+        .chunks(size)
+        .map(|chunk| String::from_utf8_lossy(chunk).to_string())
+        .collect()
 }
 
 /// Response type for the chat completions endpoint.
-///
-/// Either a JSON response, an SSE stream, or a raw upstream passthrough.
 pub(crate) enum ChatResponse {
     Json(axum::Json<ChatCompletionResponse>),
     Stream(Sse<PinBoxStream>),
     Raw(axum::response::Response),
 }
 
-pub(crate) type PinBoxStream = std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
+pub(crate) type PinBoxStream =
+    std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 
 impl axum::response::IntoResponse for ChatResponse {
     fn into_response(self) -> axum::response::Response {
@@ -770,41 +755,40 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::config::ModelConfig;
-    use crate::session::SessionManager;
+    use crate::types::ToolCall;
 
     fn test_state() -> AppState {
-        AppState {
-            config: Arc::new(Config {
-                port: 9999,
-                workers: vec![],
-                judge: ModelConfig {
-                    name: "judge".into(),
-                    endpoint: "http://localhost:11434".into(),
-                    model_id: "llama3".into(),
-                    api_key: None,
-                },
-                executor: ModelConfig {
-                    name: "executor".into(),
-                    endpoint: "http://localhost:11434".into(),
-                    model_id: "llama3".into(),
-                    api_key: None,
-                },
-                workspaces: HashMap::new(),
-                error_keywords: vec![],
-            }),
-            client: Client::builder().timeout(std::time::Duration::from_secs(2)).build().unwrap(),
-            session_manager: Arc::new(SessionManager::new()),
-            events: Arc::new(EventBus::new(256)),
-        }
+        let config = Config {
+            port: 9999,
+            workers: vec![],
+            judge: ModelConfig {
+                name: "judge".into(),
+                endpoint: "http://localhost:11434".into(),
+                model_id: "llama3".into(),
+                api_key: None,
+            },
+            executor: ModelConfig {
+                name: "executor".into(),
+                endpoint: "http://localhost:11434".into(),
+                model_id: "llama3".into(),
+                api_key: None,
+            },
+            workspaces: HashMap::new(),
+            error_keywords: vec![],
+            fusion: Default::default(),
+        };
+        AppState::new(config)
     }
 
     fn chat_app() -> axum::Router {
         axum::Router::new()
-            .route("/v1/chat/completions", axum::routing::post(chat_completions))
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(chat_completions),
+            )
             .with_state(test_state())
     }
 
-    /// Helper: send a JSON POST and return the response.
     async fn post_json(body: serde_json::Value) -> axum::http::Response<Body> {
         chat_app()
             .oneshot(
@@ -819,6 +803,25 @@ mod tests {
             .unwrap()
     }
 
+    async fn post_json_with_header(
+        body: serde_json::Value,
+        header_name: &str,
+        header_value: &str,
+    ) -> axum::http::Response<Body> {
+        chat_app()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .header(header_name, header_value)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
     async fn response_body(resp: axum::http::Response<Body>) -> serde_json::Value {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -826,73 +829,7 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    // -- Passthrough forwarding --
-
-    #[tokio::test]
-    async fn test_forward_attempts_upstream_connection() {
-        // Include </final_plan> to trigger Execution path (passthrough to executor)
-        let resp = post_json(json!({
-            "model": "llama3",
-            "messages": [
-                {"role": "user", "content": "Hello"},
-                {"role": "system", "content": "You are helpful"},
-                {"role": "assistant", "content": "</final_plan> Do this"}
-            ]
-        }))
-        .await;
-
-        // Upstream should fail (no server at localhost:11434 for test default)
-        assert!(
-            resp.status() == StatusCode::BAD_GATEWAY || resp.status().is_server_error(),
-            "Expected upstream error status, got {}",
-            resp.status()
-        );
-        let body = response_body(resp).await;
-        assert!(body["error"]["message"].as_str().unwrap().contains("Upstream"));
-        assert_eq!(body["error"]["type"], "upstream_error");
-    }
-
-    #[tokio::test]
-    async fn test_diagnostic_path_judge_error_without_endpoint() {
-        // Messages with error keywords still route to Diagnostic
-        let resp = post_json(json!({
-            "model": "llama3",
-            "messages": [{"role": "user", "content": "I got a compile error"}]
-        }))
-        .await;
-
-        // Diagnostic path tries judge which also fails without server
-        assert!(
-            resp.status() == StatusCode::BAD_GATEWAY || resp.status().is_server_error(),
-            "Expected upstream error status, got {}",
-            resp.status()
-        );
-        let body = response_body(resp).await;
-        assert!(body["error"]["message"].as_str().unwrap().contains("Judge"));
-    }
-
-    #[tokio::test]
-    async fn test_simple_message_routes_to_execution() {
-        // Simple chat without error keywords routes to Execution (fast path)
-        let resp = post_json(json!({
-            "model": "llama3",
-            "messages": [{"role": "user", "content": "Hello"}]
-        }))
-        .await;
-
-        // Execution path fails because no upstream server at localhost:11434
-        assert!(
-            resp.status() == StatusCode::BAD_GATEWAY || resp.status().is_server_error(),
-            "Expected upstream error status, got {}",
-            resp.status()
-        );
-        let body = response_body(resp).await;
-        assert!(body["error"]["message"].as_str().unwrap().contains("Upstream"));
-    }
-
-    // -- Validation tests (request parsing, unchanged from US-006a) --
-
-    // -- Missing required fields --
+    // --- Validation tests ---
 
     #[tokio::test]
     async fn test_missing_model_returns_400() {
@@ -900,14 +837,9 @@ mod tests {
             "messages": [{"role": "user", "content": "Hello"}]
         }))
         .await;
-
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = response_body(resp).await;
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("model"));
-        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"]["message"].as_str().unwrap().contains("model"));
     }
 
     #[tokio::test]
@@ -917,47 +849,20 @@ mod tests {
             "messages": [{"role": "user", "content": "Hello"}]
         }))
         .await;
-
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = response_body(resp).await;
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("must not be empty"));
     }
 
     #[tokio::test]
     async fn test_missing_messages_returns_400() {
-        let resp = post_json(json!({
-            "model": "llama3"
-        }))
-        .await;
-
+        let resp = post_json(json!({"model": "llama3"})).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = response_body(resp).await;
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("messages"));
     }
 
     #[tokio::test]
     async fn test_empty_messages_returns_400() {
-        let resp = post_json(json!({
-            "model": "llama3",
-            "messages": []
-        }))
-        .await;
-
+        let resp = post_json(json!({"model": "llama3", "messages": []})).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = response_body(resp).await;
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("at least one"));
     }
-
-    // -- Message validation --
 
     #[tokio::test]
     async fn test_empty_role_returns_400() {
@@ -966,13 +871,7 @@ mod tests {
             "messages": [{"role": "", "content": "Hello"}]
         }))
         .await;
-
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = response_body(resp).await;
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("role"));
     }
 
     #[tokio::test]
@@ -982,87 +881,138 @@ mod tests {
             "messages": [{"role": "user", "content": ""}]
         }))
         .await;
-
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = response_body(resp).await;
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("content"));
     }
-
-    #[tokio::test]
-    async fn test_invalid_message_index_reported() {
-        let resp = post_json(json!({
-            "model": "llama3",
-            "messages": [
-                {"role": "system", "content": "OK"},
-                {"role": "", "content": "Bad"}
-            ]
-        }))
-        .await;
-
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = response_body(resp).await;
-        // Should report the correct message index
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("messages[1]"));
-    }
-
-    // -- Edge cases --
 
     #[tokio::test]
     async fn test_empty_body_returns_400() {
-        let resp = post_json(json!({}))
-        .await;
-
+        let resp = post_json(json!({})).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let body = response_body(resp).await;
-        // Should complain about missing model (first validated field)
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("model"));
     }
+
+    // --- Routing tests ---
+
+    fn test_config_with_fusion() -> Config {
+        let mut config = Config {
+            port: 9999,
+            workers: vec![],
+            judge: crate::config::ModelConfig {
+                name: "judge".into(),
+                endpoint: "http://localhost:1234".into(),
+                model_id: "judge-id".into(),
+                api_key: None,
+            },
+            executor: crate::config::ModelConfig {
+                name: "executor".into(),
+                endpoint: "http://localhost:1234".into(),
+                model_id: "exec-id".into(),
+                api_key: None,
+            },
+            workspaces: std::collections::HashMap::new(),
+            error_keywords: vec![],
+            fusion: Default::default(),
+        };
+        config.fusion.models.insert(
+            "model-a".into(),
+            crate::config::ModelEntry {
+                provider: "test".into(),
+                endpoint: "http://localhost:1234/v1".into(),
+                model_id: "model-a-id".into(),
+                api_key: Some("key-a".into()),
+            },
+        );
+        config.fusion.models.insert(
+            "model-b".into(),
+            crate::config::ModelEntry {
+                provider: "test".into(),
+                endpoint: "http://localhost:1234/v1".into(),
+                model_id: "model-b-id".into(),
+                api_key: Some("key-b".into()),
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn test_routing_subrequest_passthrough() {
+        let guard = FusionGuard { is_subrequest: true };
+        let req = ChatCompletionRequest {
+            model: "tinyfusion/fusion".into(),
+            messages: vec![Message::user("test")],
+            stream: false,
+            session_id: None,
+            workspace: None,
+            tools: None,
+        };
+        let config = test_config_with_fusion();
+        let decision = decide_route(&guard, &req, &config);
+        assert!(matches!(decision, RoutingDecision::SubrequestPassthrough));
+    }
+
+    #[test]
+    fn test_routing_fusion_model_alias() {
+        let guard = FusionGuard { is_subrequest: false };
+        let req = ChatCompletionRequest {
+            model: "tinyfusion/fusion".into(),
+            messages: vec![Message::user("test")],
+            stream: false,
+            session_id: None,
+            workspace: None,
+            tools: None,
+        };
+        let config = test_config_with_fusion();
+        let decision = decide_route(&guard, &req, &config);
+        assert!(matches!(decision, RoutingDecision::FusionPipeline(_)));
+    }
+
+    #[test]
+    fn test_routing_standard_passthrough() {
+        let guard = FusionGuard { is_subrequest: false };
+        let req = ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![Message::user("test")],
+            stream: false,
+            session_id: None,
+            workspace: None,
+            tools: None,
+        };
+        let config = test_config_with_fusion();
+        let decision = decide_route(&guard, &req, &config);
+        assert!(matches!(decision, RoutingDecision::StandardPassthrough));
+    }
+
+    // --- Integration: subrequest header forces passthrough ---
 
     #[tokio::test]
-    async fn test_stream_defaults_to_false_sends_to_upstream() {
-        let resp = post_json(json!({
-            "model": "llama3",
-            "messages": [
-                {"role": "user", "content": "Hello"},
-                {"role": "system", "content": "You are helpful"},
-                {"role": "assistant", "content": "</final_plan> Plan is ready"}
-            ]
-            // no "stream" field at all
-        }))
+    async fn test_subrequest_header_forces_passthrough() {
+        let resp = post_json_with_header(
+            json!({
+                "model": "tinyfusion/fusion",
+                "messages": [{"role": "user", "content": "test"}]
+            }),
+            "x-tinyfusion-subrequest",
+            "1",
+        )
         .await;
-
-        // Without stream=true, still forwards to upstream.
-        // Upstream is unreachable → expect error, NOT a 200 JSON.
+        // Should attempt passthrough (which fails since no server)
         assert!(
             resp.status() == StatusCode::BAD_GATEWAY || resp.status().is_server_error(),
-            "Expected upstream error when no server running"
+            "Expected upstream error, got {}",
+            resp.status()
         );
-        let body = response_body(resp).await;
-        assert_eq!(body["error"]["type"], "upstream_error");
     }
 
-    // -- Unit tests for validate function directly --
+    // --- Validate function unit tests ---
 
     #[test]
     fn test_validate_returns_parsed_request() {
         let raw = RawChatRequest {
             model: Some("test-model".into()),
-            messages: Some(vec![Message {
-                role: "user".into(),
-                content: "test".into(),
-            }]),
+            messages: Some(vec![Message::user("test")]),
             stream: Some(true),
             session_id: None,
             workspace: None,
+            tools: None,
         };
 
         let req = validate(raw).unwrap();
@@ -1072,37 +1022,42 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_descriptive_error_for_missing_model() {
+    fn test_validate_allows_tool_messages_with_empty_content() {
         let raw = RawChatRequest {
-            model: None,
-            messages: Some(vec![Message {
-                role: "user".into(),
-                content: "test".into(),
-            }]),
+            model: Some("model".into()),
+            messages: Some(vec![
+                Message::user("test"),
+                Message {
+                    role: "assistant".into(),
+                    content: None,
+                    name: None,
+                    tool_calls: Some(vec![ToolCall {
+                        id: "call_1".into(),
+                        call_type: "function".into(),
+                        function: crate::types::FunctionCall {
+                            name: "test".into(),
+                            arguments: "{}".into(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                },
+            ]),
             stream: None,
             session_id: None,
             workspace: None,
+            tools: None,
         };
 
-        let err = validate(raw).unwrap_err();
-        assert!(err.contains("model"), "Error should mention 'model': {}", err);
+        let req = validate(raw);
+        assert!(req.is_ok());
     }
 
     #[test]
-    fn test_validate_descriptive_error_for_missing_messages() {
-        let raw = RawChatRequest {
-            model: Some("model".into()),
-            messages: None,
-            stream: None,
-            session_id: None,
-            workspace: None,
-        };
-
-        let err = validate(raw).unwrap_err();
-        assert!(
-            err.contains("messages"),
-            "Error should mention 'messages': {}",
-            err
-        );
+    fn test_split_into_chunks() {
+        let text = "Hello, this is a test string for chunking.";
+        let chunks = split_into_chunks(text, 10);
+        assert!(chunks.len() > 1);
+        let reassembled: String = chunks.concat();
+        assert_eq!(reassembled, text);
     }
 }

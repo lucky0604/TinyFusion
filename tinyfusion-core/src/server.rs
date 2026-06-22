@@ -124,32 +124,26 @@ pub fn app(config: Config) -> Router {
 /// Build a test router without real config (for testing).
 #[cfg(test)]
 pub fn test_app() -> Router {
-    use reqwest::Client;
-    use crate::session::SessionManager;
-    use crate::events::EventBus;
-    let state = AppState {
-        config: std::sync::Arc::new(Config {
-            port: 9999,
-            workers: vec![],
-            judge: crate::config::ModelConfig {
-                name: "judge".into(),
-                endpoint: "http://localhost:11434".into(),
-                model_id: "llama3".into(),
-                api_key: None,
-            },
-            executor: crate::config::ModelConfig {
-                name: "executor".into(),
-                endpoint: "http://localhost:11434".into(),
-                model_id: "llama3".into(),
-                api_key: None,
-            },
-            workspaces: std::collections::HashMap::new(),
-            error_keywords: vec![],
-        }),
-        client: Client::new(),
-        session_manager: std::sync::Arc::new(SessionManager::new()),
-        events: std::sync::Arc::new(EventBus::new(256)),
+    let config = Config {
+        port: 9999,
+        workers: vec![],
+        judge: crate::config::ModelConfig {
+            name: "judge".into(),
+            endpoint: "http://localhost:11434".into(),
+            model_id: "llama3".into(),
+            api_key: None,
+        },
+        executor: crate::config::ModelConfig {
+            name: "executor".into(),
+            endpoint: "http://localhost:11434".into(),
+            model_id: "llama3".into(),
+            api_key: None,
+        },
+        workspaces: std::collections::HashMap::new(),
+        error_keywords: vec![],
+        fusion: Default::default(),
     };
+    let state = AppState::new(config);
     Router::new()
         .route("/health", get(health_check))
         .route("/v1/chat/completions", post(chat::chat_completions))

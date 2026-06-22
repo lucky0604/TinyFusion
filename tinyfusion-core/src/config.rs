@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
-/// Model endpoint configuration used for workers, judge, and executor.
+/// Model endpoint configuration used for workers, judge, and executor (legacy).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     pub name: String,
@@ -12,6 +12,79 @@ pub struct ModelConfig {
     pub model_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+}
+
+/// A model entry in the Unified Model Registry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelEntry {
+    pub provider: String,
+    pub endpoint: String,
+    pub model_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+/// Fusion deliberation pipeline configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FusionConfig {
+    #[serde(default = "default_outer_model")]
+    pub default_outer_model: String,
+    #[serde(default = "default_judge_model")]
+    pub default_judge_model: String,
+    #[serde(default = "default_fusion_timeout")]
+    pub timeout_seconds: u64,
+    #[serde(default)]
+    pub presets: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub models: HashMap<String, ModelEntry>,
+    #[serde(default)]
+    pub enable_debate: bool,
+    #[serde(default)]
+    pub enable_fact_check: bool,
+    #[serde(default)]
+    pub enable_self_healing: bool,
+}
+
+fn default_outer_model() -> String {
+    "default".into()
+}
+fn default_judge_model() -> String {
+    "default".into()
+}
+fn default_fusion_timeout() -> u64 {
+    30
+}
+
+impl Default for FusionConfig {
+    fn default() -> Self {
+        Self {
+            default_outer_model: default_outer_model(),
+            default_judge_model: default_judge_model(),
+            timeout_seconds: default_fusion_timeout(),
+            presets: HashMap::new(),
+            models: HashMap::new(),
+            enable_debate: false,
+            enable_fact_check: false,
+            enable_self_healing: false,
+        }
+    }
+}
+
+impl FusionConfig {
+    /// Look up a model entry by its registry name.
+    pub fn get_model(&self, name: &str) -> Option<&ModelEntry> {
+        self.models.get(name)
+    }
+
+    /// Resolve panel models from a preset name, or return the raw list.
+    pub fn resolve_panel_models(&self, models: &[String]) -> Vec<String> {
+        if models.len() == 1 {
+            if let Some(preset) = self.presets.get(&models[0]) {
+                return preset.clone();
+            }
+        }
+        models.to_vec()
+    }
 }
 
 /// Workspace entry: maps a workspace name to its path, verify command, and retry/timeout settings.
@@ -36,12 +109,31 @@ fn default_max_retries() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub port: u16,
+    /// Legacy: worker model configurations. Kept for backward compatibility.
+    #[serde(default)]
     pub workers: Vec<ModelConfig>,
+    /// Legacy: judge model. Kept for backward compatibility.
+    #[serde(default = "default_legacy_model")]
     pub judge: ModelConfig,
+    /// Legacy: executor model. Kept for backward compatibility.
+    #[serde(default = "default_legacy_model")]
     pub executor: ModelConfig,
+    #[serde(default)]
     pub workspaces: HashMap<String, WorkspaceConfig>,
     #[serde(default = "default_error_keywords")]
     pub error_keywords: Vec<String>,
+    /// New Fusion deliberation pipeline configuration.
+    #[serde(default)]
+    pub fusion: FusionConfig,
+}
+
+fn default_legacy_model() -> ModelConfig {
+    ModelConfig {
+        name: "default".into(),
+        endpoint: "http://localhost:11434".into(),
+        model_id: "llama3".into(),
+        api_key: None,
+    }
 }
 
 fn default_error_keywords() -> Vec<String> {
@@ -91,6 +183,7 @@ impl Config {
             },
             workspaces: HashMap::new(),
             error_keywords: default_error_keywords(),
+            fusion: FusionConfig::default(),
         }
     }
 
@@ -147,13 +240,17 @@ mod tests {
     /// Helper: write a JSON string to a temp file and return (path, dir_for_cleanup).
     /// The caller should remove the temp dir after the test.
     fn write_config_temp(content: &str) -> (PathBuf, PathBuf) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "tinyfusion_cfg_test_{}_{}",
+            "tinyfusion_cfg_test_{}_{}_{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .subsec_nanos()
+                .subsec_nanos(),
+            unique
         ));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.json");

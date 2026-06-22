@@ -1,6 +1,7 @@
 pub mod chat;
 pub mod config;
 pub mod events;
+pub mod harness;
 pub mod keepalive;
 pub mod moa;
 pub mod oracle;
@@ -8,3 +9,5 @@ pub mod proxy;
 pub mod server;
 pub mod session;
 pub mod sniffer;
+pub mod tool_call_parser;
+pub mod types;
