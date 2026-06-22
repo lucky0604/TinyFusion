@@ -51,7 +51,10 @@ async fn call_worker(
     messages: &[Message],
     timeout_secs: u64,
 ) -> WorkerResponse {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (compatible; TinyFusion/1.0)")
+        .build()
+        .expect("Failed to build HTTP client");
 
     let body = serde_json::json!({
         "model": config.model_id,
@@ -65,10 +68,15 @@ async fn call_worker(
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
-        client
-            .post(&config.endpoint)
-            .json(&body)
-            .send(),
+        {
+            let mut req = client
+                .post(&config.endpoint)
+                .json(&body);
+            if let Some(ref key) = config.api_key {
+                req = req.header("Authorization", format!("Bearer {}", key));
+            }
+            req.send()
+        },
     )
     .await;
 
@@ -182,6 +190,7 @@ fn extract_tag(text: &str, tag: &str) -> String {
 pub struct WorkerConfig {
     pub endpoint: String,
     pub model_id: String,
+    pub api_key: Option<String>,
 }
 
 #[cfg(test)]

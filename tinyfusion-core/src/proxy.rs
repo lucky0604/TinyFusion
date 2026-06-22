@@ -13,14 +13,17 @@ pub async fn forward_request(
     client: &Client,
     upstream_url: &str,
     body: &serde_json::Value,
+    api_key: Option<&str>,
 ) -> Result<reqwest::Response, reqwest::Error> {
     tracing::info!("Forwarding request to upstream: {}", upstream_url);
 
-    let response = client
+    let mut req = client
         .post(upstream_url)
-        .json(body)
-        .send()
-        .await?;
+        .json(body);
+    if let Some(key) = api_key {
+        req = req.header("Authorization", format!("Bearer {}", key));
+    }
+    let response = req.send().await?;
 
     tracing::debug!("Upstream responded with status: {}", response.status());
 
@@ -52,10 +55,11 @@ pub async fn forward_passthrough(
     client: &Client,
     upstream_url: &str,
     body: &serde_json::Value,
+    api_key: Option<&str>,
 ) -> Result<(axum::http::StatusCode, HeaderMap, Body), (axum::http::StatusCode, String)> {
     tracing::info!("Forwarding chat completion to upstream: {}", upstream_url);
 
-    let response = match forward_request(client, upstream_url, body).await {
+    let response = match forward_request(client, upstream_url, body, api_key).await {
         Ok(resp) => resp,
         Err(e) => {
             tracing::error!("Upstream request failed: {}", e);
@@ -116,7 +120,7 @@ mod tests {
     async fn test_forward_passthrough_connection_refused() {
         let client = Client::builder().timeout(std::time::Duration::from_secs(1)).build().unwrap();
         let url = "http://127.0.0.1:19999/chat/completions";
-        let result = forward_passthrough(&client, url, &json!({"model":"t","messages":[]})).await;
+        let result = forward_passthrough(&client, url, &json!({"model":"t","messages":[]}), None).await;
         assert!(result.is_err(), "Expected error for refused connection");
     }
 
@@ -157,7 +161,7 @@ mod tests {
         let server = MockServer::start().await;
         let client = Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap();
         let url = format!("http://{}/chat/completions", server.addr);
-        let (status, headers, body) = forward_passthrough(&client, &url, &json!({"model":"t","messages":[{"role":"user","content":"hi"}]})).await.expect("SSE passthrough should succeed");
+        let (status, headers, body) = forward_passthrough(&client, &url, &json!({"model":"t","messages":[{"role":"user","content":"hi"}]}), None).await.expect("SSE passthrough should succeed");
         assert_eq!(status, axum::http::StatusCode::OK);
         assert!(headers.get("content-type").unwrap().to_str().unwrap().contains("text/event-stream"));
         assert_eq!(headers.get("cache-control").unwrap().to_str().unwrap(), "no-cache");
@@ -172,7 +176,7 @@ mod tests {
         let server = MockServer::start().await;
         let client = Client::builder().timeout(std::time::Duration::from_secs(3)).build().unwrap();
         let url = format!("http://{}/chat/completions", server.addr);
-        let (_, _, body) = forward_passthrough(&client, &url, &json!({"model":"t","messages":[]})).await.expect("should succeed");
+        let (_, _, body) = forward_passthrough(&client, &url, &json!({"model":"t","messages":[]}), None).await.expect("should succeed");
         let bytes = axum::body::to_bytes(body, 65536).await.unwrap();
         assert!(!bytes.is_empty(), "SSE body should not be empty");
     }

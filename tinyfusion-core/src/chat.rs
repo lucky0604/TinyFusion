@@ -33,9 +33,13 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: Config) -> Self {
+        let client = Client::builder()
+            .user_agent("Mozilla/5.0 (compatible; TinyFusion/1.0)")
+            .build()
+            .expect("Failed to build HTTP client");
         Self {
             config: Arc::new(config),
-            client: Client::new(),
+            client,
             session_manager: Arc::new(SessionManager::new()),
             events: Arc::new(EventBus::new(256)),
         }
@@ -400,6 +404,7 @@ async fn handle_diagnostic(
         .map(|m| WorkerConfig {
             endpoint: m.endpoint.clone(),
             model_id: m.model_id.clone(),
+            api_key: m.api_key.clone(),
         })
         .collect();
 
@@ -436,7 +441,13 @@ async fn handle_diagnostic(
     let chat_id = generate_id();
     let created = current_timestamp();
 
-    match state.client.post(&judge_url).json(&judge_body).send().await {
+    match {
+        let mut req = state.client.post(&judge_url).json(&judge_body);
+        if let Some(ref key) = judge_config.api_key {
+            req = req.header("Authorization", format!("Bearer {}", key));
+        }
+        req.send().await
+    } {
         Ok(resp) => {
             let status = resp.status();
             if !status.is_success() {
@@ -612,7 +623,7 @@ async fn handle_execution(
         "stream": req.stream,
     });
 
-    match forward_passthrough(&state.client, &upstream_url, &upstream_body).await {
+    match forward_passthrough(&state.client, &upstream_url, &upstream_body, state.config.executor.api_key.as_deref()).await {
         Ok((status, headers, body)) => {
             state.session_manager.set_state(session_id, SessionState::Verify);
             state.session_manager.save_snapshot();

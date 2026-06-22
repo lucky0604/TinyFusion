@@ -520,9 +520,13 @@ export function Models() {
       return m
     }))
     try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+      if (model.apiKey) {
+        headers['Authorization'] = `Bearer ${model.apiKey}`
+      }
       const resp = await fetch(`${model.endpoint}/chat/completions`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify({ model: model.modelId, messages: [{ role: 'user', content: 'test' }], max_tokens: 1 }),
         signal: AbortSignal.timeout(10000),
       })
