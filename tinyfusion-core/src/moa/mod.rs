@@ -73,7 +73,9 @@ async fn call_worker(
                 .post(&config.endpoint)
                 .json(&body);
             if let Some(ref key) = config.api_key {
-                req = req.header("Authorization", format!("Bearer {}", key));
+                if !key.is_empty() {
+                    req = req.header("Authorization", format!("Bearer {}", key));
+                }
             }
             req.send()
         },

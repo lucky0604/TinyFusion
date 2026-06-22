@@ -444,7 +444,9 @@ async fn handle_diagnostic(
     match {
         let mut req = state.client.post(&judge_url).json(&judge_body);
         if let Some(ref key) = judge_config.api_key {
-            req = req.header("Authorization", format!("Bearer {}", key));
+            if !key.is_empty() {
+                req = req.header("Authorization", format!("Bearer {}", key));
+            }
         }
         req.send().await
     } {

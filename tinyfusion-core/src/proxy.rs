@@ -20,7 +20,7 @@ pub async fn forward_request(
     let mut req = client
         .post(upstream_url)
         .json(body);
-    if let Some(key) = api_key {
+    if let Some(key) = api_key.filter(|k| !k.is_empty()) {
         req = req.header("Authorization", format!("Bearer {}", key));
     }
     let response = req.send().await?;
