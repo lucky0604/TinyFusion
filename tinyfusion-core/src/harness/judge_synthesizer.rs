@@ -25,6 +25,9 @@ Rules:
 - Be concise but precise in your analysis.
 - Identify genuine disagreements, not just different phrasing of the same idea."#;
 
+/// Default temperature for the judge model to encourage deterministic structured output.
+const DEFAULT_JUDGE_TEMPERATURE: f64 = 0.1;
+
 #[async_trait]
 impl HarnessTool for JudgeSynthesizer {
     fn name(&self) -> &'static str {
@@ -58,10 +61,7 @@ impl HarnessTool for JudgeSynthesizer {
                 ))
             })?;
 
-        let url = format!(
-            "{}/chat/completions",
-            model_entry.endpoint.trim_end_matches('/')
-        );
+        let url = crate::proxy::build_chat_url(&model_entry.endpoint);
 
         let body = serde_json::json!({
             "model": model_entry.model_id,
@@ -71,16 +71,12 @@ impl HarnessTool for JudgeSynthesizer {
             ],
             "stream": false,
             "response_format": {"type": "json_object"},
-            "temperature": 0.1,
+            "temperature": DEFAULT_JUDGE_TEMPERATURE,
         });
 
         let mut req = state.client.post(&url).json(&body);
         req = req.header(FusionGuard::HEADER_NAME, "1");
-        if let Some(ref key) = model_entry.api_key {
-            if !key.is_empty() {
-                req = req.header("Authorization", format!("Bearer {}", key));
-            }
-        }
+        req = crate::proxy::add_bearer_auth(req, model_entry.api_key.as_deref());
 
         let timeout = state.config.fusion.timeout_seconds;
         let result = tokio::time::timeout(
@@ -114,21 +110,19 @@ impl HarnessTool for JudgeSynthesizer {
             .await
             .map_err(|e| HarnessError::ExecutionFailed(format!("Failed to parse judge response: {}", e)))?;
 
-        let content = json["choices"]
-            .as_array()
-            .and_then(|c| c.first())
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
+        let content = crate::harness::panel_dispatcher::extract_content_from_response(&json)
             .ok_or_else(|| {
                 HarnessError::ExecutionFailed("Judge response missing content".into())
             })?;
 
-        let analysis = parse_judge_json(content)?;
+        let analysis = parse_judge_json(&content)?;
         ctx.structured_analysis = Some(analysis);
         Ok(())
     }
 }
+
+/// Maximum characters of raw judge output to include in parse error traces.
+const PARSE_ERROR_TRUNCATION_LIMIT: usize = 500;
 
 /// Parse the judge's JSON output into a StructuredAnalysis.
 /// Falls back to a minimal structure if JSON parsing fails.
@@ -137,7 +131,7 @@ fn parse_judge_json(content: &str) -> Result<StructuredAnalysis, HarnessError> {
         tracing::warn!(
             "Judge output was not valid StructuredAnalysis JSON: {}. Raw: {}",
             e,
-            &content[..content.len().min(500)]
+            &content[..content.len().min(PARSE_ERROR_TRUNCATION_LIMIT)]
         );
         HarnessError::SchemaValidationFailed(format!(
             "Judge JSON parse error: {}",

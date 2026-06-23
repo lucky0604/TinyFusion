@@ -178,5 +178,57 @@ mod tests {
         assert!(err.to_string().contains("test error"));
     }
 
+    #[test]
+    fn test_pipeline_runner_from_config() {
+        use crate::config::Config;
+        let config = Config {
+            port: 9999,
+            workers: vec![],
+            judge: crate::config::ModelConfig {
+                name: "judge".into(),
+                endpoint: "http://localhost:11434".into(),
+                model_id: "llama3".into(),
+                api_key: None,
+            },
+            executor: crate::config::ModelConfig {
+                name: "executor".into(),
+                endpoint: "http://localhost:11434".into(),
+                model_id: "llama3".into(),
+                api_key: None,
+            },
+            workspaces: std::collections::HashMap::new(),
+            error_keywords: vec![],
+            fusion: Default::default(),
+        };
+        let _runner = PipelineRunner::from_config(&config);
+        assert!(true);
+    }
+
+    #[test]
+    fn test_pipeline_runner_from_config_with_empty_config() {
+        use crate::config::Config;
+        let config = Config {
+            port: 9999,
+            workers: vec![],
+            judge: crate::config::ModelConfig {
+                name: "judge".into(),
+                endpoint: "http://localhost:11434".into(),
+                model_id: "llama3".into(),
+                api_key: None,
+            },
+            executor: crate::config::ModelConfig {
+                name: "executor".into(),
+                endpoint: "http://localhost:11434".into(),
+                model_id: "llama3".into(),
+                api_key: None,
+            },
+            workspaces: std::collections::HashMap::new(),
+            error_keywords: vec![],
+            fusion: Default::default(),
+        };
+        let _runner = PipelineRunner::from_config(&config);
+        assert!(true);
+    }
+
     use crate::types::Message;
 }

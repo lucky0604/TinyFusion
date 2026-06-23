@@ -37,8 +37,10 @@ pub struct FusionConfig {
     pub presets: HashMap<String, Vec<String>>,
     #[serde(default)]
     pub models: HashMap<String, ModelEntry>,
+    /// Planned: enable multi-turn debate between panel models (not yet implemented).
     #[serde(default)]
     pub enable_debate: bool,
+    /// Planned: enable fact-checking pass after judge synthesis (not yet implemented).
     #[serde(default)]
     pub enable_fact_check: bool,
     #[serde(default)]
@@ -423,5 +425,47 @@ mod tests {
         let config = Config::load(&path).unwrap();
         assert_eq!(config.error_keywords, vec!["segfault", "null pointer"]);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_fusion_config_get_model_found() {
+        let mut config = Config::default_config();
+        config.fusion.models.insert("m1".into(), crate::config::ModelEntry {
+            provider: "test".into(),
+            endpoint: "http://localhost:1".into(),
+            model_id: "m1-id".into(),
+            api_key: Some("k1".into()),
+        });
+        let entry = config.fusion.get_model("m1");
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().model_id, "m1-id");
+    }
+
+    #[test]
+    fn test_fusion_config_get_model_not_found() {
+        let config = Config::default_config();
+        assert!(config.fusion.get_model("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_resolve_panel_models_from_preset() {
+        let mut config = Config::default_config();
+        config.fusion.presets.insert("fast".into(), vec!["a".into(), "b".into()]);
+        let resolved = config.fusion.resolve_panel_models(&["fast".into()]);
+        assert_eq!(resolved, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_resolve_panel_models_fallback() {
+        let config = Config::default_config();
+        let resolved = config.fusion.resolve_panel_models(&["m1".into(), "m2".into()]);
+        assert_eq!(resolved, vec!["m1", "m2"]);
+    }
+
+    #[test]
+    fn test_config_default_includes_fusion() {
+        let config = Config::default_config();
+        assert_eq!(config.fusion.timeout_seconds, 30);
+        assert!(config.fusion.models.is_empty());
     }
 }

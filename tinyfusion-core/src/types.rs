@@ -269,4 +269,36 @@ mod tests {
         let guard = FusionGuard::from_headers(&headers);
         assert!(guard.is_subrequest);
     }
+
+    #[test]
+    fn test_fusion_guard_true_string() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-tinyfusion-subrequest", "true".parse().unwrap());
+        let guard = FusionGuard::from_headers(&headers);
+        assert!(guard.is_subrequest);
+    }
+
+    #[test]
+    fn test_fusion_guard_false_string() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-tinyfusion-subrequest", "0".parse().unwrap());
+        let guard = FusionGuard::from_headers(&headers);
+        assert!(!guard.is_subrequest);
+    }
+
+    #[test]
+    fn test_fusion_guard_invalid_value() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-tinyfusion-subrequest", "yes".parse().unwrap());
+        let guard = FusionGuard::from_headers(&headers);
+        assert!(!guard.is_subrequest);
+    }
+
+    #[test]
+    fn test_fusion_guard_empty_value() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-tinyfusion-subrequest", "".parse().unwrap());
+        let guard = FusionGuard::from_headers(&headers);
+        assert!(!guard.is_subrequest);
+    }
 }

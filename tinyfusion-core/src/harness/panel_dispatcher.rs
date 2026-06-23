@@ -85,10 +85,7 @@ async fn call_panel_model(
         format!("Model '{}' not found in fusion.models registry", model_name)
     })?;
 
-    let url = format!(
-        "{}/chat/completions",
-        entry.endpoint.trim_end_matches('/')
-    );
+    let url = crate::proxy::build_chat_url(&entry.endpoint);
 
     tracing::info!(
         "[PanelModel] Calling {} → {} (model_id: {})",
@@ -107,11 +104,7 @@ async fn call_panel_model(
 
     req = req.header(FusionGuard::HEADER_NAME, "1");
 
-    if let Some(ref key) = entry.api_key {
-        if !key.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", key));
-        }
-    }
+    req = crate::proxy::add_bearer_auth(req, entry.api_key.as_deref());
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs),
@@ -151,7 +144,7 @@ async fn call_panel_model(
 }
 
 /// Extract the assistant's content from a standard OpenAI chat completion response.
-fn extract_content_from_response(json: &serde_json::Value) -> Option<String> {
+pub(crate) fn extract_content_from_response(json: &serde_json::Value) -> Option<String> {
     json["choices"]
         .as_array()?
         .first()?

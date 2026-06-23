@@ -485,7 +485,7 @@ async fn handle_fusion_pipeline(
             let tool_output = serde_json::to_string_pretty(&analysis).unwrap_or_default();
 
             if req.stream {
-                let content_chunks = split_into_chunks(&tool_output, 80);
+                let content_chunks = split_into_chunks(&tool_output, SSE_CHUNK_SIZE);
                 Ok(ChatResponse::Stream(Sse::new(build_sse_stream(
                     &req.model,
                     content_chunks,
@@ -522,14 +522,14 @@ async fn handle_passthrough(
     // Try to find the model in fusion registry first
     let (upstream_url, model_id, api_key) = if let Some(entry) = state.config.fusion.get_model(&req.model) {
         (
-            format!("{}/chat/completions", entry.endpoint.trim_end_matches('/')),
+            crate::proxy::build_chat_url(&entry.endpoint),
             entry.model_id.clone(),
             entry.api_key.clone(),
         )
     } else {
         // Fall back to legacy executor config
         (
-            format!("{}/chat/completions", state.config.executor.endpoint.trim_end_matches('/')),
+            crate::proxy::build_chat_url(&state.config.executor.endpoint),
             state.config.executor.model_id.clone(),
             state.config.executor.api_key.clone(),
         )
@@ -604,7 +604,7 @@ async fn handle_legacy_diagnostic(
 
     let judge_config = &state.config.judge;
     let judge_url =
-        format!("{}/chat/completions", judge_config.endpoint.trim_end_matches('/'));
+        crate::proxy::build_chat_url(&judge_config.endpoint);
 
     let judge_body = serde_json::json!({
         "model": judge_config.model_id,
@@ -623,11 +623,7 @@ async fn handle_legacy_diagnostic(
 
     let judge_result = {
         let mut req_builder = state.client.post(&judge_url).json(&judge_body);
-        if let Some(ref key) = judge_config.api_key {
-            if !key.is_empty() {
-                req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
-            }
-        }
+        req_builder = crate::proxy::add_bearer_auth(req_builder, judge_config.api_key.as_deref());
         req_builder.send().await
     };
     match judge_result {
@@ -717,8 +713,14 @@ async fn handle_legacy_diagnostic(
     }
 }
 
+/// Default SSE chunk size in bytes for streaming fusion analysis output.
+const SSE_CHUNK_SIZE: usize = 80;
+
 /// Split text into chunks of approximately `size` characters for streaming.
 fn split_into_chunks(text: &str, size: usize) -> Vec<String> {
+    if size == 0 {
+        return vec![text.to_string()];
+    }
     text.as_bytes()
         .chunks(size)
         .map(|chunk| String::from_utf8_lossy(chunk).to_string())
@@ -981,6 +983,94 @@ mod tests {
         assert!(matches!(decision, RoutingDecision::StandardPassthrough));
     }
 
+    #[test]
+    fn test_routing_fusion_tool_in_tools_array() {
+        let guard = FusionGuard { is_subrequest: false };
+        let req = ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![Message::user("test")],
+            stream: false,
+            session_id: None,
+            workspace: None,
+            tools: Some(vec![serde_json::json!({
+                "type": "function",
+                "function": {
+                    "name": "tinyfusion_deliberate",
+                    "description": "Fusion tool"
+                }
+            })]),
+        };
+        let config = test_config_with_fusion();
+        let decision = decide_route(&guard, &req, &config);
+        assert!(matches!(decision, RoutingDecision::FusionPipeline(_)));
+    }
+
+    #[test]
+    fn test_routing_fusion_tool_call_in_assistant_message() {
+        let guard = FusionGuard { is_subrequest: false };
+        let req = ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![
+                Message::user("test"),
+                Message {
+                    role: "assistant".into(),
+                    content: None,
+                    name: None,
+                    tool_calls: Some(vec![crate::types::ToolCall {
+                        id: "call_1".into(),
+                        call_type: "function".into(),
+                        function: crate::types::FunctionCall {
+                            name: "tinyfusion_deliberate".into(),
+                            arguments: r#"{"analysis_models":["model-a","model-b"]}"#.into(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                },
+            ],
+            stream: false,
+            session_id: None,
+            workspace: None,
+            tools: None,
+        };
+        let config = test_config_with_fusion();
+        let decision = decide_route(&guard, &req, &config);
+        assert!(matches!(decision, RoutingDecision::FusionPipeline(_)));
+    }
+
+    #[test]
+    fn test_routing_legacy_diagnostic_without_fusion_models() {
+        let guard = FusionGuard { is_subrequest: false };
+        let req = ChatCompletionRequest {
+            model: "llama3".into(),
+            messages: vec![Message::user("I got a compile error")],
+            stream: false,
+            session_id: None,
+            workspace: None,
+            tools: None,
+        };
+        let config = Config {
+            port: 9999,
+            workers: vec![],
+            judge: crate::config::ModelConfig {
+                name: "judge".into(),
+                endpoint: "http://localhost:11434".into(),
+                model_id: "llama3".into(),
+                api_key: None,
+            },
+            executor: crate::config::ModelConfig {
+                name: "executor".into(),
+                endpoint: "http://localhost:11434".into(),
+                model_id: "llama3".into(),
+                api_key: None,
+            },
+            workspaces: std::collections::HashMap::new(),
+            error_keywords: vec!["error".into(), "compile".into()],
+            fusion: Default::default(),
+        };
+        let decision = decide_route(&guard, &req, &config);
+        assert!(matches!(decision, RoutingDecision::LegacyDiagnostic));
+    }
+
     // --- Integration: subrequest header forces passthrough ---
 
     #[tokio::test]
@@ -1059,5 +1149,85 @@ mod tests {
         assert!(chunks.len() > 1);
         let reassembled: String = chunks.concat();
         assert_eq!(reassembled, text);
+    }
+
+    #[test]
+    fn test_split_into_chunks_zero_size() {
+        let text = "Hello world";
+        let chunks = split_into_chunks(text, 0);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], text);
+    }
+
+    #[test]
+    fn test_split_into_chunks_empty() {
+        let chunks = split_into_chunks("", 10);
+        assert!(chunks.is_empty() || (chunks.len() == 1 && chunks[0].is_empty()));
+    }
+
+    #[test]
+    fn test_split_into_chunks_single_byte() {
+        let text = "ABCDEF";
+        let chunks = split_into_chunks(text, 1);
+        assert_eq!(chunks.len(), 6);
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
+    fn test_split_into_chunks_unicode() {
+        let text = "こんにちは世界";
+        let chunks = split_into_chunks(text, 80);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], text);
+    }
+
+    // --- Integration: error path tests (no upstream server) ---
+
+    #[tokio::test]
+    async fn test_fusion_pipeline_error_returns_500() {
+        // Fusion model alias with no fusion models configured → pipeline fails
+        let resp = post_json(json!({
+            "model": "tinyfusion/fusion",
+            "messages": [{"role": "user", "content": "test"}]
+        }))
+        .await;
+        // Fusion pipeline requires at least one model; without any, it fails
+        assert!(
+            resp.status().is_server_error() || resp.status() == StatusCode::BAD_GATEWAY,
+            "Expected server error or bad gateway, got {}",
+            resp.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_standard_passthrough_upstream_failure() {
+        // Standard model passthrough with no upstream server running
+        let resp = post_json(json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .await;
+        // No fusion models configured for "gpt-4o", falls back to executor at localhost:11434
+        assert!(
+            resp.status() == StatusCode::BAD_GATEWAY || resp.status().is_server_error(),
+            "Expected upstream error, got {}",
+            resp.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_diagnostic_upstream_failure() {
+        // Error keywords should trigger legacy diagnostic path
+        let resp = post_json(json!({
+            "model": "llama3",
+            "messages": [{"role": "user", "content": "I got a compile error"}]
+        }))
+        .await;
+        // Legacy diagnostic tries judge which also fails without server
+        assert!(
+            resp.status() == StatusCode::BAD_GATEWAY || resp.status().is_server_error(),
+            "Expected judge or upstream error, got {}",
+            resp.status()
+        );
     }
 }

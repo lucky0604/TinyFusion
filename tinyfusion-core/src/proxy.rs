@@ -46,6 +46,19 @@ pub fn stream_to_body(
     Body::from_stream(stream.map_err(axum::Error::new))
 }
 
+/// Build a chat completions endpoint URL from a base endpoint.
+pub fn build_chat_url(endpoint: &str) -> String {
+    format!("{}/chat/completions", endpoint.trim_end_matches('/'))
+}
+
+/// Add a Bearer auth header to a request if an API key is provided and non-empty.
+pub fn add_bearer_auth(req: reqwest::RequestBuilder, api_key: Option<&str>) -> reqwest::RequestBuilder {
+    match api_key {
+        Some(key) if !key.is_empty() => req.header("Authorization", format!("Bearer {}", key)),
+        _ => req,
+    }
+}
+
 /// Forward a chat completion request to the upstream executor and return
 /// the response body for direct passthrough to the client.
 ///

@@ -100,4 +100,21 @@ mod tests {
         let result = QueryRefiner.execute(&mut ctx, &state).await;
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn test_query_refiner_non_user_last_message() {
+        let state = mock_state();
+        let mut ctx = PipelineContext::new(
+            "test".into(),
+            vec![Message::user("Q1"), Message::assistant("A1")],
+            vec!["m1".into()],
+            "judge".into(),
+            false,
+        );
+        QueryRefiner.execute(&mut ctx, &state).await.unwrap();
+        // Last message is assistant, so no suffix should be appended
+        let last = ctx.refined_messages.last().unwrap();
+        assert_eq!(last.role, "assistant");
+        assert!(!last.content_str().contains("multiple perspectives"));
+    }
 }
