@@ -13,7 +13,7 @@ fn test_full_state_machine_cycle() {
 
     assert_eq!(sniffer::sniff_state(&messages), RequestState::Diagnostic);
 
-    manager.get_or_create(id.clone(), messages);
+    manager.get_or_create(id.clone(), messages, vec![]);
     let session = manager.lookup(&id).unwrap();
     assert_eq!(session.state, SessionState::Diagnostic);
 
@@ -67,7 +67,7 @@ fn test_session_retry_loop() {
         Message { role: "user".into(), content: "fix the bug".into() },
     ];
     let id = Session::id_from_messages(&messages);
-    manager.get_or_create(id.clone(), messages);
+    manager.get_or_create(id.clone(), messages, vec![]);
 
     for _ in 0..3 {
         manager.set_state(&id, SessionState::Verify);
@@ -87,7 +87,7 @@ fn test_session_retry_counter() {
         Message { role: "user".into(), content: "test".into() },
     ];
     let id = Session::id_from_messages(&messages);
-    manager.get_or_create(id.clone(), messages);
+    manager.get_or_create(id.clone(), messages, vec![]);
 
     for i in 1..=5 {
         manager.increment_retry(&id);
@@ -111,8 +111,8 @@ fn test_concurrent_sessions_independent() {
     let id2 = Session::id_from_messages(&msgs2);
     assert_ne!(id1, id2);
 
-    manager.get_or_create(id1.clone(), msgs1);
-    manager.get_or_create(id2.clone(), msgs2);
+    manager.get_or_create(id1.clone(), msgs1, vec![]);
+    manager.get_or_create(id2.clone(), msgs2, vec![]);
 
     manager.increment_retry(&id1);
     manager.increment_retry(&id1);

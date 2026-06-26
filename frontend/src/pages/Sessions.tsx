@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
-import { ChevronDown, ChevronRight, Clock, Activity, RefreshCw, CheckCircle2, XCircle, Trash2 } from 'lucide-react'
+import { ChevronDown, ChevronRight, Clock, Activity, RefreshCw, CheckCircle2, Trash2 } from 'lucide-react'
 
-type SessionState = 'Diagnostic' | 'Execution' | 'Verify' | 'Retry' | 'Done' | 'Failed'
+type SessionState = 'Diagnostic' | 'Execution' | 'Verify' | 'Done'
 
 interface SessionEntry {
   id: string
@@ -20,9 +20,7 @@ const STATE_CONFIG: Record<SessionState, { label: string; color: string; icon: R
   Diagnostic: { label: 'Diagnostic', color: 'var(--status-active)', icon: <Activity size={14} /> },
   Execution: { label: 'Execution', color: 'var(--status-info)', icon: <RefreshCw size={14} /> },
   Verify: { label: 'Verify', color: 'var(--status-warning)', icon: <CheckCircle2 size={14} /> },
-  Retry: { label: 'Retry', color: 'var(--status-error)', icon: <RefreshCw size={14} /> },
   Done: { label: 'Done', color: 'var(--text-tertiary)', icon: <CheckCircle2 size={14} /> },
-  Failed: { label: 'Failed', color: 'var(--status-error)', icon: <XCircle size={14} /> },
 }
 
 export function Sessions() {
@@ -56,7 +54,7 @@ export function Sessions() {
         await fetch(`http://localhost:9999/v1/sessions/${id}`, { method: 'DELETE' })
         fetchSessions()
       } catch (err) {
-        alert('Failed to end session: ' + err)
+        console.error('Failed to end session:', err)
       }
     }
   }
@@ -95,7 +93,7 @@ export function Sessions() {
                   <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: stateCfg.color }} />
                   <span className="font-medium text-sm text-[var(--text-primary)] flex-1 truncate">{session.name}</span>
                   <span className="text-xs px-2 py-0.5 rounded-full font-medium" style={{ backgroundColor: stateCfg.color + '20', color: stateCfg.color, border: '1px solid ' + stateCfg.color + '40' }}>
-                    {session.state === 'Retry' ? `Retry ${session.retryCount}/${session.maxRetries}` : stateCfg.label}
+                    {stateCfg.label}
                   </span>
                   <span className="flex items-center gap-1 text-xs text-[var(--text-tertiary)]">
                     <Clock size={12} /> {session.duration}

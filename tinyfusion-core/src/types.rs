@@ -167,6 +167,7 @@ pub struct PanelResponse {
 pub struct FusionMetrics {
     pub request_id: String,
     pub timestamp: u64,
+    pub request_type: String,
     pub total_latency_ms: u64,
     pub outer_model: String,
     pub panel_models: Vec<String>,

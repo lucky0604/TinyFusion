@@ -24,6 +24,7 @@ impl HarnessTool for MetricsLogger {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            request_type: "fusion".into(),
             total_latency_ms: ctx.total_latency_ms(),
             outer_model: String::new(),
             panel_models: ctx.panel_models.clone(),
@@ -82,6 +83,7 @@ mod tests {
         let metrics = FusionMetrics {
             request_id: "test-123".into(),
             timestamp: 1234567890,
+            request_type: "fusion".into(),
             total_latency_ms: 1500,
             outer_model: "claude".into(),
             panel_models: vec!["gpt-4o".into(), "claude".into()],

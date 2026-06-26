@@ -2,7 +2,7 @@
 //!
 //! Handles POST /v1/chat/completions with the new Fusion deliberation pipeline:
 //!   1. FusionGuard check (subrequest → forced passthrough)
-//!   2. Model alias check (tinyfusion/fusion → Fusion pipeline)
+//!   2. Model alias check (tinyfusion → Fusion pipeline)
 //!   3. Tool presence check (tinyfusion_deliberate in tools → Fusion pipeline)
 //!   4. Standard passthrough (all other requests)
 
@@ -477,6 +477,7 @@ async fn handle_fusion_pipeline(
     let (session_id, _) = state.session_manager.get_or_create(
         req.session_id.clone().unwrap_or_else(|| request_id.clone()),
         sniffer_msgs,
+        panel_models.clone(),
     );
     state.session_manager.set_state(&session_id, crate::session::SessionState::Diagnostic);
 
@@ -550,7 +551,11 @@ async fn handle_passthrough(
     }).collect();
 
     // 联动 SessionManager: 始终创建并更新状态为 Execution，追加消息，使其在前端 Dashboard/Sessions 可见
-    let (actual_session_id, _) = state.session_manager.get_or_create(session_id, sniffer_msgs);
+    let (actual_session_id, _) = state.session_manager.get_or_create(
+        session_id,
+        sniffer_msgs,
+        vec![req.model.clone()],
+    );
     state.session_manager.set_state(&actual_session_id, crate::session::SessionState::Execution);
     state.events.emit(
         GatewayEvent::new("execution", "Execution phase started, forwarding to upstream model")
@@ -597,6 +602,7 @@ async fn handle_passthrough(
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
+                request_type: "passthrough".into(),
                 total_latency_ms: latency_ms,
                 outer_model: req.model.clone(),
                 panel_models: vec![model_id.clone()],
@@ -645,6 +651,7 @@ async fn handle_passthrough(
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
+                request_type: "passthrough".into(),
                 total_latency_ms: latency_ms,
                 outer_model: req.model.clone(),
                 panel_models: vec![model_id.clone()],

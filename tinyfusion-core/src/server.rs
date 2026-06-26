@@ -144,7 +144,7 @@ async fn get_sessions(
             "state": format!("{:?}", s.state), // Diagnostic, Execution, Verify, Done
             "retryCount": s.retry_count,
             "maxRetries": 3,
-            "workers": "qwen2.5-coder:7b, deepseek-coder:6.7b",
+            "workers": s.models.join(", "),
             "duration": duration_str,
             "requests": s.retry_count + 1,
             "tokens": token_count,
@@ -206,7 +206,12 @@ pub fn app(config: Config) -> Router {
     }
 
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin([
+            "http://localhost:5173".parse().unwrap(),
+            "http://127.0.0.1:5173".parse().unwrap(),
+            "tauri://localhost".parse().unwrap(),
+            "http://tauri.localhost".parse().unwrap(),
+        ])
         .allow_methods(Any)
         .allow_headers(Any);
 

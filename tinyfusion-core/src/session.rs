@@ -19,17 +19,19 @@ pub struct Session {
     pub state: SessionState,
     pub retry_count: u32,
     pub messages: Vec<crate::sniffer::Message>,
+    pub models: Vec<String>,
     pub created_at: std::time::SystemTime,
 }
 
 impl Session {
     /// Create a new session with the given identifier.
-    pub fn new(id: String, messages: Vec<crate::sniffer::Message>) -> Self {
+    pub fn new(id: String, messages: Vec<crate::sniffer::Message>, models: Vec<String>) -> Self {
         Self {
             id,
             state: SessionState::Diagnostic,
             retry_count: 0,
             messages,
+            models,
             created_at: std::time::SystemTime::now(),
         }
     }
@@ -57,6 +59,7 @@ pub struct SessionSnapshot {
     pub state: SessionState,
     pub retry_count: u32,
     pub messages: Vec<crate::sniffer::Message>,
+    pub models: Vec<String>,
     pub created_at_secs: u64,
 }
 
@@ -96,6 +99,7 @@ impl SessionManager {
                 state: s.state.clone(),
                 retry_count: s.retry_count,
                 messages: s.messages.clone(),
+                models: s.models.clone(),
                 created_at_secs: s.created_at
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -137,6 +141,7 @@ impl SessionManager {
                     state: snap.state.clone(),
                     retry_count: snap.retry_count,
                     messages: snap.messages.clone(),
+                    models: snap.models.clone(),
                     created_at: std::time::UNIX_EPOCH
                         + std::time::Duration::from_secs(snap.created_at_secs),
                 };
@@ -156,6 +161,7 @@ impl SessionManager {
         &self,
         identifier: String,
         messages: Vec<crate::sniffer::Message>,
+        models: Vec<String>,
     ) -> (String, bool) {
         let mut sessions = self.sessions.lock().unwrap();
 
@@ -168,7 +174,7 @@ impl SessionManager {
             return (identifier, false);
         }
 
-        let session = Session::new(identifier.clone(), messages);
+        let session = Session::new(identifier.clone(), messages, models);
         sessions.insert(identifier.clone(), session);
         (identifier, false)
     }
@@ -251,7 +257,7 @@ mod tests {
         let messages = test_messages();
         let id = Session::id_from_messages(&messages);
 
-        let (returned_id, collision) = manager.get_or_create(id.clone(), messages);
+        let (returned_id, collision) = manager.get_or_create(id.clone(), messages, vec![]);
         assert_eq!(returned_id, id);
         assert!(!collision);
         let lookup = manager.lookup(&id);
@@ -267,7 +273,7 @@ mod tests {
         let messages = test_messages();
         let id = Session::id_from_messages(&messages);
 
-        let _ = manager.get_or_create(id.clone(), messages);
+        let _ = manager.get_or_create(id.clone(), messages, vec![]);
 
         manager.set_state(&id, SessionState::Execution);
         let session = manager.lookup(&id).unwrap();
@@ -286,9 +292,9 @@ mod tests {
         let id2 = Session::id_from_messages(&messages2);
         assert_ne!(id1, id2, "Test requires different hashes");
 
-        manager.get_or_create(id1.clone(), messages1);
+        manager.get_or_create(id1.clone(), messages1, vec![]);
 
-        let (_, collision) = manager.get_or_create(id1.clone(), messages2);
+        let (_, collision) = manager.get_or_create(id1.clone(), messages2, vec![]);
         assert!(collision);
     }
 
@@ -306,7 +312,7 @@ mod tests {
         let messages = test_messages();
         let id = Session::id_from_messages(&messages);
 
-        let _ = manager.get_or_create(id.clone(), messages);
+        let _ = manager.get_or_create(id.clone(), messages, vec![]);
 
         manager.increment_retry(&id);
         manager.increment_retry(&id);
@@ -319,7 +325,7 @@ mod tests {
         let manager = SessionManager::new();
         let messages = test_messages();
         let id = Session::id_from_messages(&messages);
-        let _ = manager.get_or_create(id.clone(), messages);
+        let _ = manager.get_or_create(id.clone(), messages, vec![]);
 
         let new_state = manager.transition(&id, 3).unwrap();
         assert_eq!(new_state, SessionState::Execution);
@@ -331,7 +337,7 @@ mod tests {
         let manager = SessionManager::new();
         let messages = test_messages();
         let id = Session::id_from_messages(&messages);
-        let _ = manager.get_or_create(id.clone(), messages);
+        let _ = manager.get_or_create(id.clone(), messages, vec![]);
 
         manager.set_state(&id, SessionState::Execution);
         let new_state = manager.transition(&id, 3).unwrap();
@@ -343,7 +349,7 @@ mod tests {
         let manager = SessionManager::new();
         let messages = test_messages();
         let id = Session::id_from_messages(&messages);
-        let _ = manager.get_or_create(id.clone(), messages);
+        let _ = manager.get_or_create(id.clone(), messages, vec![]);
 
         manager.set_state(&id, SessionState::Verify);
         // retry_count starts at 0, max_retries is 0 → should go to Done
@@ -356,7 +362,7 @@ mod tests {
         let manager = SessionManager::new();
         let messages = test_messages();
         let id = Session::id_from_messages(&messages);
-        let _ = manager.get_or_create(id.clone(), messages);
+        let _ = manager.get_or_create(id.clone(), messages, vec![]);
 
         manager.set_state(&id, SessionState::Verify);
         // retry_count 0 < max 3 → should retry to Diagnostic
@@ -370,7 +376,7 @@ mod tests {
         let manager = SessionManager::new();
         let messages = test_messages();
         let id = Session::id_from_messages(&messages);
-        let _ = manager.get_or_create(id.clone(), messages);
+        let _ = manager.get_or_create(id.clone(), messages, vec![]);
 
         manager.set_state(&id, SessionState::Done);
         let result = manager.transition(&id, 3);
@@ -382,7 +388,7 @@ mod tests {
         let manager = SessionManager::new();
         let messages = test_messages();
         let id = Session::id_from_messages(&messages);
-        let _ = manager.get_or_create(id.clone(), messages);
+        let _ = manager.get_or_create(id.clone(), messages, vec![]);
 
         manager.set_state(&id, SessionState::Verify);
         manager.increment_retry(&id);

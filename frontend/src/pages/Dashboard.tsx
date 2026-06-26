@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { ChevronDown, ArrowDown } from 'lucide-react'
 
-type SessionState = 'Diagnostic' | 'Execution' | 'Verify' | 'Retry' | 'Done' | 'Failed'
+type SessionState = 'Diagnostic' | 'Execution' | 'Verify' | 'Done'
 type LogPhase = 'diag' | 'exec' | 'veri' | 'retry' | 'info'
 
 interface LogEntry {
@@ -34,9 +34,7 @@ const STATE_CONFIG: Record<SessionState, { color: string; borderColor: string; p
   Diagnostic: { color: 'var(--status-active)', borderColor: 'rgba(34,197,94,0.3)', pulse: true },
   Execution: { color: 'var(--status-info)', borderColor: 'rgba(59,130,246,0.3)', pulse: false },
   Verify: { color: 'var(--status-warning)', borderColor: 'rgba(245,158,11,0.3)', pulse: false },
-  Retry: { color: 'var(--status-error)', borderColor: 'rgba(239,68,68,0.3)', pulse: true },
   Done: { color: 'var(--status-active)', borderColor: 'rgba(34,197,94,0.3)', pulse: false },
-  Failed: { color: 'var(--status-error)', borderColor: 'rgba(239,68,68,0.3)', pulse: false },
 }
 
 const PHASE_COLORS: Record<LogPhase, { bg: string; text: string; border: string }> = {
@@ -50,8 +48,7 @@ const PHASE_COLORS: Record<LogPhase, { bg: string; text: string; border: string 
 function SessionCard({ session, onEnd }: { session: SessionInfo; onEnd: (id: string) => void }) {
   const cfg = STATE_CONFIG[session.state]
   const opacity = session.state === 'Done' ? 0.85 : 1
-  const stateLabel = session.state === 'Retry' && session.retryCount !== undefined
-    ? `Retry ${session.retryCount}/${session.maxRetries ?? 3}` : session.state
+  const stateLabel = session.state
 
   return (
     <div style={{
@@ -68,14 +65,6 @@ function SessionCard({ session, onEnd }: { session: SessionInfo; onEnd: (id: str
         </div>
         <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem', color: 'var(--text-tertiary)' }}>{session.sessionName}</span>
       </div>
-      {session.state === 'Retry' && session.lastError && (
-        <div style={{ marginBottom: 12, padding: 8, background: 'var(--bg-tertiary)', borderRadius: 'var(--radius-sm)' }}>
-          <div style={{ fontFamily: 'var(--font-mono)', fontSize: '0.75rem', color: 'var(--text-secondary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            Last error: {session.lastError}
-          </div>
-          {session.suggestedAction && <div style={{ fontSize: '0.75rem', color: 'var(--text-tertiary)' }}>{session.suggestedAction}</div>}
-        </div>
-      )}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, fontSize: '0.8125rem', color: 'var(--text-secondary)' }}>
         <div>Workers: <span style={{ color: 'var(--text-primary)', fontWeight: 500 }}>{session.stats.workers}</span></div>
         <div>Duration: <span style={{ color: 'var(--text-primary)', fontWeight: 500, fontFamily: 'var(--font-mono)' }}>{session.stats.duration}</span></div>
@@ -83,11 +72,7 @@ function SessionCard({ session, onEnd }: { session: SessionInfo; onEnd: (id: str
         <div>Tokens: <span style={{ color: 'var(--text-primary)', fontWeight: 500, fontFamily: 'var(--font-mono)' }}>{session.stats.tokens.toLocaleString()}</span></div>
       </div>
       <div style={{ marginTop: 'auto', paddingTop: 16 }}>
-        {session.state === 'Failed' ? (
-          <button onClick={() => onEnd(session.id)} style={dangerBtnStyle}>Retry</button>
-        ) : (
-          <button onClick={() => onEnd(session.id)} style={{ ...dangerBtnStyle, opacity: 0.7 }}>End Session</button>
-        )}
+        <button onClick={() => onEnd(session.id)} style={{ ...dangerBtnStyle, opacity: 0.7 }}>End Session</button>
       </div>
     </div>
   )
@@ -179,7 +164,7 @@ export function Dashboard() {
         await fetch(`http://localhost:9999/v1/sessions/${id}`, { method: 'DELETE' })
         fetchSessions()
       } catch (e) {
-        alert('Failed to end session: ' + e)
+        console.error('Failed to end session:', e)
       }
     }
   }
