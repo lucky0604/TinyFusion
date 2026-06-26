@@ -1,7 +1,7 @@
-/// Oracle module — runs verification commands and captures their output.
-///
-/// The oracle executes workspace verify commands and determines success/failure
-/// based on exit codes, feeding results back into the retry loop.
+//! Oracle module — runs verification commands and captures their output.
+//!
+//! The oracle executes workspace verify commands and determines success/failure
+//! based on exit codes, feeding results back into the retry loop.
 
 use std::process::Stdio;
 use tokio::process::Command;
