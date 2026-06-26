@@ -1,7 +1,7 @@
-/// SSE keep-alive module.
-///
-/// Sends periodic keep-alive comments to prevent client timeout during long computations.
-/// SSE comments (lines starting with `:`) are ignored by standard SSE parsers.
+//! SSE keep-alive module.
+//!
+//! Sends periodic keep-alive comments to prevent client timeout during long computations.
+//! SSE comments (lines starting with `:`) are ignored by standard SSE parsers.
 
 use axum::response::sse::Event;
 use tokio::time::{interval, Duration};

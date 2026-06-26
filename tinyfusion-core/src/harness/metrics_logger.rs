@@ -3,10 +3,10 @@ use std::io::Write;
 
 use super::{HarnessError, HarnessTool, PipelineContext};
 use crate::chat::AppState;
-use crate::types::FusionMetrics;
+use crate::types::RequestMetrics;
 
-/// Module H: MetricsLogger — persists per-request fusion metrics
-/// to ~/.tinyfusion/fusion_metrics.jsonl for frontend visualization.
+/// Module H: MetricsLogger — persists per-request metrics
+/// to ~/.tinyfusion/metrics.jsonl for frontend visualization.
 pub struct MetricsLogger;
 
 #[async_trait]
@@ -18,7 +18,7 @@ impl HarnessTool for MetricsLogger {
     async fn execute(&self, ctx: &mut PipelineContext, _state: &AppState) -> Result<(), HarnessError> {
         let analysis = ctx.structured_analysis.as_ref();
 
-        let metrics = FusionMetrics {
+        let metrics = RequestMetrics {
             request_id: ctx.request_id.clone(),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -48,7 +48,7 @@ impl HarnessTool for MetricsLogger {
 }
 
 /// Append a single metrics line to the JSONL file.
-pub(crate) fn append_metrics(metrics: &FusionMetrics) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn append_metrics(metrics: &RequestMetrics) -> Result<(), Box<dyn std::error::Error>> {
     let path = metrics_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -71,7 +71,7 @@ fn metrics_path() -> std::path::PathBuf {
         .unwrap_or_else(|_| ".".to_string());
     std::path::PathBuf::from(home)
         .join(".tinyfusion")
-        .join("fusion_metrics.jsonl")
+        .join("metrics.jsonl")
 }
 
 #[cfg(test)]
@@ -80,7 +80,7 @@ mod tests {
 
     #[test]
     fn test_metrics_serialization() {
-        let metrics = FusionMetrics {
+        let metrics = RequestMetrics {
             request_id: "test-123".into(),
             timestamp: 1234567890,
             request_type: "fusion".into(),

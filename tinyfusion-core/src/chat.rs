@@ -15,6 +15,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::budget::BudgetManager;
 use crate::config::Config;
 use crate::events::{EventBus, GatewayEvent};
 use crate::harness::{PipelineContext, PipelineRunner};
@@ -35,11 +36,17 @@ pub struct AppState {
     pub session_manager: Arc<SessionManager>,
     pub events: Arc<EventBus>,
     pub pipeline_runner: Arc<PipelineRunner>,
+    pub budget: Arc<BudgetManager>,
 }
 
 impl AppState {
     pub fn new(config: Config) -> Self {
         let pipeline_runner = PipelineRunner::from_config(&config);
+        let budget_config = config
+            .fusion
+            .budget
+            .clone()
+            .unwrap_or_default();
         let client = Client::builder()
             .user_agent("Mozilla/5.0 (compatible; TinyFusion/1.0)")
             .build()
@@ -50,6 +57,7 @@ impl AppState {
             session_manager: Arc::new(SessionManager::new()),
             events: Arc::new(EventBus::new(256)),
             pipeline_runner: Arc::new(pipeline_runner),
+            budget: Arc::new(BudgetManager::new(budget_config)),
         }
     }
 }
@@ -63,6 +71,8 @@ pub struct ChatCompletionRequest {
     pub session_id: Option<String>,
     pub workspace: Option<String>,
     pub tools: Option<Vec<serde_json::Value>>,
+    /// Original request body for passthrough forwarding (preserves all client fields).
+    pub raw_body: serde_json::Value,
 }
 
 /// Routing decision for a chat completion request.
@@ -72,10 +82,17 @@ enum RoutingDecision {
     SubrequestPassthrough,
     /// Fusion pipeline via model alias or tool presence.
     FusionPipeline(DeliberateArgs),
-    /// Standard passthrough to executor.
+    /// Standard passthrough to executor (no smart routing).
     StandardPassthrough,
+    /// Smart-routed passthrough: complexity-based model selection.
+    SmartPassthrough {
+        target_model: String,
+        tier: crate::config::ModelTier,
+    },
     /// Legacy diagnostic/MoA path (backward compat).
     LegacyDiagnostic,
+    /// Budget exhausted — reject with 429.
+    BudgetExhausted,
 }
 
 /// A single message in a chat completion response (assistant reply).
@@ -247,6 +264,9 @@ pub(crate) struct RawChatRequest {
     workspace: Option<String>,
     #[serde(default)]
     tools: Option<Vec<serde_json::Value>>,
+    /// Original JSON body preserved for passthrough (model field will be rewritten).
+    #[serde(skip)]
+    raw_json: Option<serde_json::Value>,
 }
 
 /// Validate a raw request and return a structured ChatCompletionRequest.
@@ -288,6 +308,7 @@ fn validate(raw: RawChatRequest) -> Result<ChatCompletionRequest, String> {
     }
 
     let stream = raw.stream.unwrap_or(false);
+    let raw_body = raw.raw_json.unwrap_or_else(|| serde_json::json!({}));
 
     Ok(ChatCompletionRequest {
         model,
@@ -296,14 +317,16 @@ fn validate(raw: RawChatRequest) -> Result<ChatCompletionRequest, String> {
         session_id: raw.session_id,
         workspace: raw.workspace,
         tools: raw.tools,
+        raw_body,
     })
 }
 
-/// Resolve default panel models from config: use the first preset if available,
-/// otherwise use all registered models except the judge.
+/// Resolve default panel models from config: use the first preset (sorted by name)
+/// if available, otherwise use all registered models except the judge.
 fn resolve_default_panel_models(config: &Config) -> Vec<String> {
-    // Try the first preset
-    if let Some((_, models)) = config.fusion.presets.iter().next() {
+    // Use the alphabetically first preset for deterministic behavior
+    if let Some(key) = config.fusion.presets.keys().min() {
+        let models = &config.fusion.presets[key];
         if !models.is_empty() {
             return models.clone();
         }
@@ -329,6 +352,7 @@ fn decide_route(
     guard: &FusionGuard,
     req: &ChatCompletionRequest,
     config: &Config,
+    budget: &BudgetManager,
 ) -> RoutingDecision {
     let has_fusion_models = !config.fusion.models.is_empty();
 
@@ -374,9 +398,39 @@ fn decide_route(
         }
     }
 
-    // 5. Legacy: check for error keywords to route to diagnostic (backward compat)
+    // 5. Smart routing: only when routing config exists AND the client did NOT
+    //    specify a known upstream model (i.e. model field is empty or matches
+    //    no registered fusion model). If the client explicitly names a model
+    //    like "gpt-4o" that isn't in fusion.models, skip smart routing and
+    //    do a standard passthrough to preserve OpenAI-compatible semantics.
     if has_fusion_models {
-        // If fusion config has models, prefer standard passthrough
+        if let Some(routing_config) = &config.fusion.routing {
+            let model_is_registered = config.fusion.models.contains_key(&req.model);
+            let model_is_generic = req.model.is_empty()
+                || req.model == "auto"
+                || model_is_registered;
+
+            if model_is_generic {
+                let tier = crate::complexity::classify_complexity(
+                    &req.messages,
+                    &config.error_keywords,
+                    routing_config,
+                );
+
+                // Try to find a model for this tier, with fallback chain
+                if let Some((model_name, _)) = find_model_for_tier(config, tier, budget) {
+                    return RoutingDecision::SmartPassthrough {
+                        target_model: model_name,
+                        tier,
+                    };
+                }
+
+                // All tiers exhausted: no local fallback and budget exceeded
+                return RoutingDecision::BudgetExhausted;
+            }
+        }
+
+        // Client specified a non-fusion model (e.g. "gpt-4o") or no routing config
         return RoutingDecision::StandardPassthrough;
     }
 
@@ -390,20 +444,71 @@ fn decide_route(
         })
         .collect();
 
-    let req_state = crate::sniffer::sniff_state(&sniff_msgs);
+    let req_state = crate::sniffer::sniff_state_with_keywords(&sniff_msgs, &config.error_keywords);
     match req_state {
         crate::sniffer::RequestState::Diagnostic => RoutingDecision::LegacyDiagnostic,
         crate::sniffer::RequestState::Execution => RoutingDecision::StandardPassthrough,
     }
 }
 
+/// Find the best model for a given tier, with deterministic fallback: Complex→Medium→Simple.
+/// Skips models whose budget is exhausted (unless local).
+fn find_model_for_tier(
+    config: &Config,
+    tier: crate::config::ModelTier,
+    budget: &BudgetManager,
+) -> Option<(String, crate::config::ModelTier)> {
+    use crate::config::ModelTier;
+    let fallback_chain = match tier {
+        ModelTier::Complex => vec![ModelTier::Complex, ModelTier::Medium, ModelTier::Simple],
+        ModelTier::Medium => vec![ModelTier::Medium, ModelTier::Simple],
+        ModelTier::Simple => vec![ModelTier::Simple],
+    };
+
+    for target_tier in fallback_chain {
+        for (name, entry) in &config.fusion.models {
+            let entry_tier = entry.tier.unwrap_or(ModelTier::Medium);
+            if entry_tier != target_tier {
+                continue;
+            }
+            let is_local = entry.is_local.unwrap_or(false);
+            // Local models are always available; cloud models require budget
+            if is_local || budget.can_afford(1000) {
+                return Some((name.clone(), target_tier));
+            }
+        }
+    }
+
+    // Last resort: any model that's local (zero cost)
+    for (name, entry) in &config.fusion.models {
+        if entry.is_local.unwrap_or(false) {
+            return Some((name.clone(), ModelTier::Simple));
+        }
+    }
+
+    None
+}
+
 /// Axum handler: parse, validate, route, and orchestrate.
 pub(crate) async fn chat_completions(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: HeaderMap,
-    axum::Json(raw): axum::Json<RawChatRequest>,
+    axum::Json(raw_json): axum::Json<serde_json::Value>,
 ) -> Result<ChatResponse, (StatusCode, axum::Json<serde_json::Value>)> {
     let guard = FusionGuard::from_headers(&headers);
+
+    let mut raw: RawChatRequest = serde_json::from_value(raw_json.clone()).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            axum::Json(serde_json::json!({
+                "error": {
+                    "message": format!("Invalid request body: {}", e),
+                    "type": "invalid_request_error"
+                }
+            })),
+        )
+    })?;
+    raw.raw_json = Some(raw_json);
 
     let req = match validate(raw) {
         Ok(r) => r,
@@ -429,7 +534,7 @@ pub(crate) async fn chat_completions(
         guard.is_subrequest
     );
 
-    let decision = decide_route(&guard, &req, &state.config);
+    let decision = decide_route(&guard, &req, &state.config, &state.budget);
 
     match decision {
         RoutingDecision::SubrequestPassthrough => {
@@ -447,9 +552,40 @@ pub(crate) async fn chat_completions(
             tracing::info!("[Route] Standard passthrough");
             handle_passthrough(&state, &req).await
         }
+        RoutingDecision::SmartPassthrough { target_model, tier } => {
+            tracing::info!(
+                "[Route] Smart passthrough: model={}, tier={:?}",
+                target_model,
+                tier
+            );
+            state.events.emit(
+                GatewayEvent::new(
+                    "routing",
+                    &format!("Smart routing → {} (tier {:?})", target_model, tier),
+                )
+            );
+            handle_smart_passthrough(&state, &req, &target_model).await
+        }
         RoutingDecision::LegacyDiagnostic => {
             tracing::info!("[Route] Legacy diagnostic path");
             handle_legacy_diagnostic(&state, &req).await
+        }
+        RoutingDecision::BudgetExhausted => {
+            tracing::warn!("[Route] Budget exhausted, returning 429");
+            let snap = state.budget.snapshot();
+            Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "message": format!(
+                            "Token budget exhausted. Daily: {}/{}, Monthly: {}/{}",
+                            snap.daily_tokens, snap.daily_limit,
+                            snap.monthly_tokens, snap.monthly_limit,
+                        ),
+                        "type": "budget_exhausted"
+                    }
+                })),
+            ))
         }
     }
 }
@@ -542,7 +678,7 @@ async fn handle_passthrough(
     state: &AppState,
     req: &ChatCompletionRequest,
 ) -> Result<ChatResponse, (StatusCode, axum::Json<serde_json::Value>)> {
-    let session_id = req.session_id.clone().unwrap_or_else(|| generate_id());
+    let session_id = req.session_id.clone().unwrap_or_else(generate_id);
     let sniffer_msgs: Vec<crate::sniffer::Message> = req.messages.iter().map(|m| {
         crate::sniffer::Message {
             role: m.role.clone(),
@@ -565,7 +701,7 @@ async fn handle_passthrough(
     // Try to find the model in fusion registry first
     let (upstream_url, model_id, api_key) = if let Some(entry) = state.config.fusion.get_model(&req.model) {
         (
-            crate::proxy::build_chat_url(&entry.endpoint),
+            crate::proxy::build_chat_url_with_path(&entry.endpoint, entry.chat_path.as_deref()),
             entry.model_id.clone(),
             entry.api_key.clone(),
         )
@@ -578,11 +714,14 @@ async fn handle_passthrough(
         )
     };
 
-    let upstream_body = serde_json::json!({
-        "model": model_id,
-        "messages": req.messages,
-        "stream": req.stream,
-    });
+    // Preserve original request body, only rewrite model to upstream model_id
+    let mut upstream_body = req.raw_body.clone();
+    if let Some(obj) = upstream_body.as_object_mut() {
+        obj.insert("model".to_string(), serde_json::Value::String(model_id.clone()));
+        // Remove TinyFusion-specific fields that upstream doesn't understand
+        obj.remove("session_id");
+        obj.remove("workspace");
+    }
 
     let start_time = std::time::Instant::now();
 
@@ -596,7 +735,7 @@ async fn handle_passthrough(
             );
 
             // 为直通（Passthrough）请求记录并存储真实的指标日志，使其能够展示在 Logs 页面中
-            let metrics = crate::types::FusionMetrics {
+            let metrics = crate::types::RequestMetrics {
                 request_id: actual_session_id.clone(),
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -645,7 +784,7 @@ async fn handle_passthrough(
             );
 
             // 失败时记录失败指标
-            let metrics = crate::types::FusionMetrics {
+            let metrics = crate::types::RequestMetrics {
                 request_id: actual_session_id.clone(),
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -670,6 +809,87 @@ async fn handle_passthrough(
                 tracing::warn!("Failed to write passthrough failure metrics: {}", e);
             }
 
+            Err((
+                status,
+                axum::Json(serde_json::json!({
+                    "error": {
+                        "message": error_msg,
+                        "type": "upstream_error"
+                    }
+                })),
+            ))
+        }
+    }
+}
+
+/// Smart-routed passthrough: forward to a specific model selected by complexity routing.
+async fn handle_smart_passthrough(
+    state: &AppState,
+    req: &ChatCompletionRequest,
+    target_model: &str,
+) -> Result<ChatResponse, (StatusCode, axum::Json<serde_json::Value>)> {
+    let entry = state.config.fusion.get_model(target_model).ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({
+                "error": {
+                    "message": format!("Smart routing target '{}' not found in config", target_model),
+                    "type": "routing_error"
+                }
+            })),
+        )
+    })?;
+
+    let upstream_url = crate::proxy::build_chat_url_with_path(
+        &entry.endpoint,
+        entry.chat_path.as_deref(),
+    );
+    let model_id = entry.model_id.clone();
+    let api_key = entry.api_key.clone();
+    let is_local = entry.is_local.unwrap_or(false);
+
+    let mut upstream_body = req.raw_body.clone();
+    if let Some(obj) = upstream_body.as_object_mut() {
+        obj.insert("model".to_string(), serde_json::Value::String(model_id.clone()));
+        obj.remove("session_id");
+        obj.remove("workspace");
+    }
+
+    let start_time = std::time::Instant::now();
+
+    match forward_passthrough(&state.client, &upstream_url, &upstream_body, api_key.as_deref()).await {
+        Ok((status, headers, body)) => {
+            let latency_ms = start_time.elapsed().as_millis() as u64;
+
+            // Token usage estimation (actual metering from response parsing is TODO 2 in TODOS.md)
+            let estimated_tokens = req
+                .messages
+                .iter()
+                .map(|m| m.content_str().len() / 4)
+                .sum::<usize>() as u64
+                + 500;
+            state.budget.record(estimated_tokens, is_local);
+
+            tracing::info!(
+                "[SmartRoute] model={} latency={}ms estimated_tokens={}",
+                target_model,
+                latency_ms,
+                estimated_tokens
+            );
+
+            let mut response = axum::response::Response::new(body);
+            *response.status_mut() = status;
+            if let Some(ct) = headers.get("content-type") {
+                response.headers_mut().insert("content-type", ct.clone());
+            }
+            response.headers_mut().insert("cache-control", "no-cache".parse().unwrap());
+            response.headers_mut().insert("connection", "keep-alive".parse().unwrap());
+            response.headers_mut().insert("x-accel-buffering", "no".parse().unwrap());
+
+            Ok(ChatResponse::Raw(response))
+        }
+        Err((status, error_msg)) => {
+            tracing::error!("[SmartRoute] Failed for {}: {}", target_model, error_msg);
             Err((
                 status,
                 axum::Json(serde_json::json!({
@@ -874,6 +1094,7 @@ mod tests {
     use std::collections::HashMap;
     use tower::ServiceExt;
 
+    use crate::budget::BudgetManager;
     use crate::config::ModelConfig;
     use crate::types::ToolCall;
 
@@ -1039,6 +1260,9 @@ mod tests {
                 endpoint: "http://localhost:1234/v1".into(),
                 model_id: "model-a-id".into(),
                 api_key: Some("key-a".into()),
+                tier: None,
+                is_local: None,
+                chat_path: None,
             },
         );
         config.fusion.models.insert(
@@ -1048,6 +1272,9 @@ mod tests {
                 endpoint: "http://localhost:1234/v1".into(),
                 model_id: "model-b-id".into(),
                 api_key: Some("key-b".into()),
+                tier: None,
+                is_local: None,
+                chat_path: None,
             },
         );
         config
@@ -1063,9 +1290,11 @@ mod tests {
             session_id: None,
             workspace: None,
             tools: None,
+            raw_body: json!({}),
         };
         let config = test_config_with_fusion();
-        let decision = decide_route(&guard, &req, &config);
+        let budget = BudgetManager::new(Default::default());
+        let decision = decide_route(&guard, &req, &config, &budget);
         assert!(matches!(decision, RoutingDecision::SubrequestPassthrough));
     }
 
@@ -1079,9 +1308,11 @@ mod tests {
             session_id: None,
             workspace: None,
             tools: None,
+            raw_body: json!({}),
         };
         let config = test_config_with_fusion();
-        let decision = decide_route(&guard, &req, &config);
+        let budget = BudgetManager::new(Default::default());
+        let decision = decide_route(&guard, &req, &config, &budget);
         assert!(matches!(decision, RoutingDecision::FusionPipeline(_)));
     }
 
@@ -1095,9 +1326,11 @@ mod tests {
             session_id: None,
             workspace: None,
             tools: None,
+            raw_body: json!({}),
         };
         let config = test_config_with_fusion();
-        let decision = decide_route(&guard, &req, &config);
+        let budget = BudgetManager::new(Default::default());
+        let decision = decide_route(&guard, &req, &config, &budget);
         assert!(matches!(decision, RoutingDecision::StandardPassthrough));
     }
 
@@ -1110,6 +1343,7 @@ mod tests {
             stream: false,
             session_id: None,
             workspace: None,
+            raw_body: json!({}),
             tools: Some(vec![serde_json::json!({
                 "type": "function",
                 "function": {
@@ -1119,7 +1353,8 @@ mod tests {
             })]),
         };
         let config = test_config_with_fusion();
-        let decision = decide_route(&guard, &req, &config);
+        let budget = BudgetManager::new(Default::default());
+        let decision = decide_route(&guard, &req, &config, &budget);
         assert!(matches!(decision, RoutingDecision::FusionPipeline(_)));
     }
 
@@ -1149,9 +1384,11 @@ mod tests {
             session_id: None,
             workspace: None,
             tools: None,
+            raw_body: json!({}),
         };
         let config = test_config_with_fusion();
-        let decision = decide_route(&guard, &req, &config);
+        let budget = BudgetManager::new(Default::default());
+        let decision = decide_route(&guard, &req, &config, &budget);
         assert!(matches!(decision, RoutingDecision::FusionPipeline(_)));
     }
 
@@ -1165,6 +1402,7 @@ mod tests {
             session_id: None,
             workspace: None,
             tools: None,
+            raw_body: json!({}),
         };
         let config = Config {
             port: 9999,
@@ -1185,7 +1423,8 @@ mod tests {
             error_keywords: vec!["error".into(), "compile".into()],
             fusion: Default::default(),
         };
-        let decision = decide_route(&guard, &req, &config);
+        let budget = BudgetManager::new(Default::default());
+        let decision = decide_route(&guard, &req, &config, &budget);
         assert!(matches!(decision, RoutingDecision::LegacyDiagnostic));
     }
 
@@ -1221,6 +1460,7 @@ mod tests {
             session_id: None,
             workspace: None,
             tools: None,
+            raw_json: None,
         };
 
         let req = validate(raw).unwrap();
@@ -1254,6 +1494,7 @@ mod tests {
             session_id: None,
             workspace: None,
             tools: None,
+            raw_json: None,
         };
 
         let req = validate(raw);
@@ -1347,5 +1588,194 @@ mod tests {
             "Expected judge or upstream error, got {}",
             resp.status()
         );
+    }
+
+    // --- Smart routing tests ---
+
+    fn test_config_with_tiers() -> Config {
+        let mut config = Config {
+            port: 9999,
+            workers: vec![],
+            judge: crate::config::ModelConfig {
+                name: "judge".into(),
+                endpoint: "http://localhost:1234".into(),
+                model_id: "judge-id".into(),
+                api_key: None,
+            },
+            executor: crate::config::ModelConfig {
+                name: "executor".into(),
+                endpoint: "http://localhost:1234".into(),
+                model_id: "exec-id".into(),
+                api_key: None,
+            },
+            workspaces: std::collections::HashMap::new(),
+            error_keywords: vec!["compile error".into(), "test failed".into()],
+            fusion: Default::default(),
+        };
+        config.fusion.routing = Some(crate::config::RoutingConfig::default());
+        config.fusion.budget = Some(crate::config::BudgetConfig {
+            daily_limit: 100_000,
+            monthly_limit: 1_000_000,
+            persist_interval_secs: 60,
+        });
+        config.fusion.models.insert(
+            "local-model".into(),
+            crate::config::ModelEntry {
+                provider: "local".into(),
+                endpoint: "http://gpu:8080/v1".into(),
+                model_id: "qwythos-9b".into(),
+                api_key: None,
+                tier: Some(crate::config::ModelTier::Simple),
+                is_local: Some(true),
+                chat_path: None,
+            },
+        );
+        config.fusion.models.insert(
+            "cloud-medium".into(),
+            crate::config::ModelEntry {
+                provider: "deepseek".into(),
+                endpoint: "http://localhost:1234/v1".into(),
+                model_id: "deepseek-chat".into(),
+                api_key: Some("sk-ds".into()),
+                tier: Some(crate::config::ModelTier::Medium),
+                is_local: Some(false),
+                chat_path: None,
+            },
+        );
+        config.fusion.models.insert(
+            "cloud-complex".into(),
+            crate::config::ModelEntry {
+                provider: "glm".into(),
+                endpoint: "http://localhost:1234/v1".into(),
+                model_id: "glm-5.2".into(),
+                api_key: Some("sk-glm".into()),
+                tier: Some(crate::config::ModelTier::Complex),
+                is_local: Some(false),
+                chat_path: None,
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn test_smart_routing_simple_message() {
+        let guard = FusionGuard { is_subrequest: false };
+        let req = ChatCompletionRequest {
+            model: "auto".into(),
+            messages: vec![Message::user("Hello!")],
+            stream: false,
+            session_id: None,
+            workspace: None,
+            tools: None,
+            raw_body: json!({}),
+        };
+        let config = test_config_with_tiers();
+        let budget = BudgetManager::new(Default::default());
+        let decision = decide_route(&guard, &req, &config, &budget);
+        match decision {
+            RoutingDecision::SmartPassthrough { tier, .. } => {
+                assert_eq!(tier, crate::config::ModelTier::Simple);
+            }
+            other => panic!("Expected SmartPassthrough, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_smart_routing_medium_message() {
+        let guard = FusionGuard { is_subrequest: false };
+        let req = ChatCompletionRequest {
+            model: "auto".into(),
+            messages: vec![Message::user("I got a compile error in my project")],
+            stream: false,
+            session_id: None,
+            workspace: None,
+            tools: None,
+            raw_body: json!({}),
+        };
+        let config = test_config_with_tiers();
+        let budget = BudgetManager::new(Default::default());
+        let decision = decide_route(&guard, &req, &config, &budget);
+        match decision {
+            RoutingDecision::SmartPassthrough { tier, .. } => {
+                assert_eq!(tier, crate::config::ModelTier::Medium);
+            }
+            other => panic!("Expected SmartPassthrough Medium, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_smart_routing_complex_message() {
+        let guard = FusionGuard { is_subrequest: false };
+        let req = ChatCompletionRequest {
+            model: "auto".into(),
+            messages: vec![Message::user(
+                "compile error and test failed when refactoring src/main.rs src/lib.rs src/config.rs",
+            )],
+            stream: false,
+            session_id: None,
+            workspace: None,
+            tools: None,
+            raw_body: json!({}),
+        };
+        let config = test_config_with_tiers();
+        let budget = BudgetManager::new(Default::default());
+        let decision = decide_route(&guard, &req, &config, &budget);
+        match decision {
+            RoutingDecision::SmartPassthrough { tier, .. } => {
+                assert_eq!(tier, crate::config::ModelTier::Complex);
+            }
+            other => panic!("Expected SmartPassthrough Complex, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_smart_routing_budget_exhausted_falls_to_local() {
+        let guard = FusionGuard { is_subrequest: false };
+        let req = ChatCompletionRequest {
+            model: "auto".into(),
+            messages: vec![Message::user("I got a compile error")],
+            stream: false,
+            session_id: None,
+            workspace: None,
+            tools: None,
+            raw_body: json!({}),
+        };
+        let config = test_config_with_tiers();
+        let budget = BudgetManager::new(crate::config::BudgetConfig {
+            daily_limit: 1,
+            monthly_limit: 1,
+            persist_interval_secs: 60,
+        });
+        // Exhaust budget
+        budget.record(100, false);
+        let decision = decide_route(&guard, &req, &config, &budget);
+        match decision {
+            RoutingDecision::SmartPassthrough { target_model, .. } => {
+                assert_eq!(target_model, "local-model");
+            }
+            other => panic!("Expected fallback to local model, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_passthrough_preserves_raw_body() {
+        let raw_json = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "test"}],
+            "temperature": 0.7,
+            "max_tokens": 1000,
+            "tools": [{"type": "function", "function": {"name": "test"}}],
+            "stream": false,
+        });
+
+        let raw: RawChatRequest = serde_json::from_value(raw_json.clone()).unwrap();
+        let mut raw_with_body = raw;
+        raw_with_body.raw_json = Some(raw_json.clone());
+        let req = validate(raw_with_body).unwrap();
+
+        // Verify raw_body contains all original fields
+        assert_eq!(req.raw_body["temperature"], 0.7);
+        assert_eq!(req.raw_body["max_tokens"], 1000);
+        assert!(req.raw_body["tools"].is_array());
     }
 }

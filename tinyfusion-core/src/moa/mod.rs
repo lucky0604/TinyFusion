@@ -1,7 +1,7 @@
-/// Multi-of-Agents (MoA) module.
-///
-/// Handles spawning concurrent worker model calls, collecting responses,
-/// and constructing/forwarding to the Judge model for synthesis.
+//! Multi-of-Agents (MoA) module.
+//!
+//! Handles spawning concurrent worker model calls, collecting responses,
+//! and constructing/forwarding to the Judge model for synthesis.
 
 use crate::sniffer::Message;
 

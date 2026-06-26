@@ -63,6 +63,12 @@ pub struct SessionSnapshot {
     pub created_at_secs: u64,
 }
 
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionManager {
     pub fn new() -> Self {
         Self {
@@ -176,6 +182,8 @@ impl SessionManager {
 
         let session = Session::new(identifier.clone(), messages, models);
         sessions.insert(identifier.clone(), session);
+        drop(sessions);
+        self.save_snapshot();
         (identifier, false)
     }
 
@@ -193,6 +201,7 @@ impl SessionManager {
         if let Some(session) = self.sessions.lock().unwrap().get_mut(id) {
             session.state = state;
         }
+        self.save_snapshot();
     }
 
     /// Increment retry counter.
@@ -229,7 +238,16 @@ impl SessionManager {
         };
 
         session.state = new_state.clone();
+        drop(sessions);
+        self.save_snapshot();
         Some(new_state)
+    }
+
+    /// Remove a session by id (with snapshot update).
+    pub fn remove_and_persist(&self, id: &str) -> Option<Session> {
+        let result = self.sessions.lock().unwrap().remove(id);
+        self.save_snapshot();
+        result
     }
 }
 

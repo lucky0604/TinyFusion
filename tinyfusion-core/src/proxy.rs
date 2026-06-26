@@ -1,6 +1,6 @@
-/// Proxy module — forwards requests to upstream model endpoints.
-///
-/// Handles request forwarding, response streaming, and error propagation.
+//! Proxy module — forwards requests to upstream model endpoints.
+//!
+//! Handles request forwarding, response streaming, and error propagation.
 
 use axum::body::Body;
 use axum::http::HeaderMap;
@@ -48,7 +48,18 @@ pub fn stream_to_body(
 
 /// Build a chat completions endpoint URL from a base endpoint.
 pub fn build_chat_url(endpoint: &str) -> String {
-    format!("{}/chat/completions", endpoint.trim_end_matches('/'))
+    build_chat_url_with_path(endpoint, None)
+}
+
+/// Build a chat completions URL with an optional custom path.
+/// If `chat_path` is provided (e.g. "/api/paas/v4/chat/completions" for Zhipu),
+/// it replaces the default "/chat/completions" suffix.
+pub fn build_chat_url_with_path(endpoint: &str, chat_path: Option<&str>) -> String {
+    let base = endpoint.trim_end_matches('/');
+    match chat_path {
+        Some(path) => format!("{}{}", base, path),
+        None => format!("{}/chat/completions", base),
+    }
 }
 
 /// Add a Bearer auth header to a request if an API key is provided and non-empty.
@@ -96,6 +107,41 @@ mod tests {
     use axum::routing::{get, post};
     use serde_json::json;
     use std::net::SocketAddr;
+
+    #[test]
+    fn test_build_chat_url_default() {
+        assert_eq!(
+            build_chat_url("http://localhost:1234/v1"),
+            "http://localhost:1234/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_build_chat_url_trailing_slash() {
+        assert_eq!(
+            build_chat_url("http://localhost:1234/v1/"),
+            "http://localhost:1234/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_build_chat_url_with_custom_path() {
+        assert_eq!(
+            build_chat_url_with_path(
+                "https://open.bigmodel.cn",
+                Some("/api/paas/v4/chat/completions")
+            ),
+            "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        );
+    }
+
+    #[test]
+    fn test_build_chat_url_with_none_path() {
+        assert_eq!(
+            build_chat_url_with_path("http://localhost:1234/v1", None),
+            "http://localhost:1234/v1/chat/completions"
+        );
+    }
 
     #[test]
     fn test_error_status_forward() {

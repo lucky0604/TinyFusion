@@ -60,6 +60,20 @@ async fn get_config(
         })
     }).collect();
 
+    // Build fusion.models for frontend
+    let mut fusion_models = serde_json::Map::new();
+    for (name, entry) in &config.fusion.models {
+        fusion_models.insert(name.clone(), serde_json::json!({
+            "provider": entry.provider,
+            "endpoint": entry.endpoint,
+            "model_id": entry.model_id,
+            "api_key": entry.api_key,
+            "tier": entry.tier,
+            "is_local": entry.is_local,
+            "chat_path": entry.chat_path,
+        }));
+    }
+
     Json(serde_json::json!({
         "port": config.port,
         "workers": workers,
@@ -77,6 +91,11 @@ async fn get_config(
         },
         "workspaces": workspaces,
         "error_keywords": &config.error_keywords,
+        "fusion": {
+            "models": fusion_models,
+            "routing": config.fusion.routing,
+            "budget": config.fusion.budget,
+        },
     }))
 }
 
@@ -117,7 +136,13 @@ async fn get_sessions(
         let name = if let Some(first_msg) = s.messages.first() {
             let content = &first_msg.content;
             if content.len() > 30 {
-                format!("{}...", &content[..30])
+                let end = content
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .take_while(|&i| i <= 30)
+                    .last()
+                    .unwrap_or(0);
+                format!("{}...", &content[..end])
             } else {
                 content.to_string()
             }
@@ -161,8 +186,20 @@ async fn delete_session(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Json<serde_json::Value> {
-    let removed = state.session_manager.remove(&id);
+    let removed = state.session_manager.remove_and_persist(&id);
     Json(json!({ "status": "ok", "removed": removed.is_some() }))
+}
+
+async fn get_budget(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let snap = state.budget.snapshot();
+    Json(json!({
+        "daily_tokens": snap.daily_tokens,
+        "daily_limit": snap.daily_limit,
+        "monthly_tokens": snap.monthly_tokens,
+        "monthly_limit": snap.monthly_limit,
+    }))
 }
 
 async fn get_metrics() -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
@@ -171,7 +208,7 @@ async fn get_metrics() -> Result<Json<serde_json::Value>, (StatusCode, Json<serd
         .unwrap_or_else(|_| ".".to_string());
     let path = std::path::PathBuf::from(home)
         .join(".tinyfusion")
-        .join("fusion_metrics.jsonl");
+        .join("metrics.jsonl");
 
     if !path.exists() {
         return Ok(Json(json!([])));
@@ -222,6 +259,7 @@ pub fn app(config: Config) -> Router {
         .route("/v1/config", get(get_config).post(post_config))
         .route("/v1/sessions", get(get_sessions))
         .route("/v1/sessions/:id", axum::routing::delete(delete_session))
+        .route("/v1/budget", get(get_budget))
         .route("/v1/metrics", get(get_metrics))
         .layer(cors)
         .with_state(state)
