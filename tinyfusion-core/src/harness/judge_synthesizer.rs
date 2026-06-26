@@ -61,7 +61,7 @@ impl HarnessTool for JudgeSynthesizer {
                 ))
             })?;
 
-        let url = crate::proxy::build_chat_url(&model_entry.endpoint);
+        let url = crate::proxy::build_chat_url_with_path(&model_entry.endpoint, model_entry.chat_path.as_deref());
 
         let body = serde_json::json!({
             "model": model_entry.model_id,

@@ -85,7 +85,7 @@ async fn call_panel_model(
         format!("Model '{}' not found in fusion.models registry", model_name)
     })?;
 
-    let url = crate::proxy::build_chat_url(&entry.endpoint);
+    let url = crate::proxy::build_chat_url_with_path(&entry.endpoint, entry.chat_path.as_deref());
 
     tracing::info!(
         "[PanelModel] Calling {} → {} (model_id: {})",
