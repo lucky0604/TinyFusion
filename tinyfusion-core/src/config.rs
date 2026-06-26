@@ -96,6 +96,30 @@ impl Default for BudgetConfig {
     }
 }
 
+/// AI complexity classifier configuration.
+/// When set, `model: "tinyfusion"` requests are pre-classified before routing:
+/// Simple requests skip MoA and go directly to `simple_target`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassifierConfig {
+    /// API endpoint base URL (e.g. "https://api.example.com/v1").
+    pub endpoint: String,
+    /// API key for the classifier model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Model ID to send in the request (e.g. "qwen3-8b").
+    pub model_id: String,
+    /// Custom chat completions path (e.g. "/api/paas/v4/chat/completions").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_path: Option<String>,
+    /// Timeout in seconds for the classifier call. Default: 5.
+    #[serde(default = "default_classifier_timeout")]
+    pub timeout_secs: u64,
+    /// Model name (key in fusion.models) to forward Simple requests to.
+    pub simple_target: String,
+}
+
+fn default_classifier_timeout() -> u64 { 5 }
+
 /// Fusion deliberation pipeline configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FusionConfig {
@@ -123,6 +147,9 @@ pub struct FusionConfig {
     /// Token budget configuration.
     #[serde(default)]
     pub budget: Option<BudgetConfig>,
+    /// AI complexity classifier: pre-classify requests before MoA.
+    #[serde(default)]
+    pub classifier: Option<ClassifierConfig>,
 }
 
 fn default_outer_model() -> String {
@@ -148,6 +175,7 @@ impl Default for FusionConfig {
             enable_self_healing: false,
             routing: None,
             budget: None,
+            classifier: None,
         }
     }
 }

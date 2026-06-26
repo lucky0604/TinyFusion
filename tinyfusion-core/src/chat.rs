@@ -91,6 +91,10 @@ enum RoutingDecision {
     },
     /// Legacy diagnostic/MoA path (backward compat).
     LegacyDiagnostic,
+    /// Needs AI classification before deciding (MoA or direct forward).
+    NeedsClassification {
+        panel_models: Vec<String>,
+    },
     /// Budget exhausted — reject with 429.
     BudgetExhausted,
 }
@@ -364,6 +368,10 @@ fn decide_route(
     // 2. Model alias: tinyfusion
     if req.model == FUSION_MODEL_ALIAS {
         let panel_models = resolve_default_panel_models(config);
+        // If classifier is configured, defer the decision to async classification
+        if config.fusion.classifier.is_some() {
+            return RoutingDecision::NeedsClassification { panel_models };
+        }
         return RoutingDecision::FusionPipeline(DeliberateArgs {
             analysis_models: panel_models,
             judge_model: None,
@@ -565,6 +573,58 @@ pub(crate) async fn chat_completions(
                 )
             );
             handle_smart_passthrough(&state, &req, &target_model).await
+        }
+        RoutingDecision::NeedsClassification { panel_models } => {
+            let classifier_config = state.config.fusion.classifier.as_ref().unwrap();
+            tracing::info!(
+                "[Route] AI classification requested via model={}",
+                classifier_config.model_id,
+            );
+
+            let is_simple = crate::complexity::classify_with_ai(
+                &state.client,
+                &req.messages,
+                classifier_config,
+            )
+            .await;
+
+            match is_simple {
+                Some(true) => {
+                    let target = &classifier_config.simple_target;
+                    if state.config.fusion.get_model(target).is_none() {
+                        tracing::warn!(
+                            "[Classifier] simple_target '{}' not found in fusion.models, falling back to MoA",
+                            target,
+                        );
+                        let args = DeliberateArgs {
+                            analysis_models: panel_models,
+                            judge_model: None,
+                        };
+                        return handle_fusion_pipeline(&state, &req, args).await;
+                    }
+                    tracing::info!(
+                        "[Route] Classifier → SIMPLE, forwarding to {}",
+                        target,
+                    );
+                    state.events.emit(GatewayEvent::new(
+                        "routing",
+                        &format!("Classifier → SIMPLE, direct forward to {}", target),
+                    ));
+                    handle_smart_passthrough(&state, &req, target).await
+                }
+                _ => {
+                    tracing::info!("[Route] Classifier → COMPLEX (or failed), using MoA pipeline");
+                    state.events.emit(GatewayEvent::new(
+                        "fusion",
+                        "Classifier → COMPLEX, MoA pipeline started",
+                    ));
+                    let args = DeliberateArgs {
+                        analysis_models: panel_models,
+                        judge_model: None,
+                    };
+                    handle_fusion_pipeline(&state, &req, args).await
+                }
+            }
         }
         RoutingDecision::LegacyDiagnostic => {
             tracing::info!("[Route] Legacy diagnostic path");
@@ -1777,5 +1837,100 @@ mod tests {
         assert_eq!(req.raw_body["temperature"], 0.7);
         assert_eq!(req.raw_body["max_tokens"], 1000);
         assert!(req.raw_body["tools"].is_array());
+    }
+
+    // --- Classifier routing tests ---
+
+    #[test]
+    fn test_routing_tinyfusion_with_classifier_returns_needs_classification() {
+        let mut config = test_config_with_fusion();
+        config.fusion.presets.insert(
+            "default".into(),
+            vec!["model-a".into(), "model-b".into()],
+        );
+        config.fusion.classifier = Some(crate::config::ClassifierConfig {
+            endpoint: "http://localhost:1234/v1".into(),
+            api_key: Some("test-key".into()),
+            model_id: "test-classifier".into(),
+            chat_path: None,
+            timeout_secs: 5,
+            simple_target: "model-b".into(),
+        });
+
+        let guard = FusionGuard { is_subrequest: false };
+        let req = ChatCompletionRequest {
+            model: FUSION_MODEL_ALIAS.into(),
+            messages: vec![Message::user("hi")],
+            stream: false,
+            session_id: None,
+            workspace: None,
+            tools: None,
+            raw_body: json!({}),
+        };
+        let budget = BudgetManager::new(Default::default());
+        let decision = decide_route(&guard, &req, &config, &budget);
+        assert!(
+            matches!(decision, RoutingDecision::NeedsClassification { .. }),
+            "Expected NeedsClassification, got {:?}",
+            decision,
+        );
+    }
+
+    #[test]
+    fn test_routing_tinyfusion_without_classifier_returns_fusion_pipeline() {
+        let mut config = test_config_with_fusion();
+        config.fusion.presets.insert(
+            "default".into(),
+            vec!["model-a".into(), "model-b".into()],
+        );
+        assert!(config.fusion.classifier.is_none());
+
+        let guard = FusionGuard { is_subrequest: false };
+        let req = ChatCompletionRequest {
+            model: FUSION_MODEL_ALIAS.into(),
+            messages: vec![Message::user("hi")],
+            stream: false,
+            session_id: None,
+            workspace: None,
+            tools: None,
+            raw_body: json!({}),
+        };
+        let budget = BudgetManager::new(Default::default());
+        let decision = decide_route(&guard, &req, &config, &budget);
+        assert!(
+            matches!(decision, RoutingDecision::FusionPipeline(_)),
+            "Expected FusionPipeline, got {:?}",
+            decision,
+        );
+    }
+
+    #[test]
+    fn test_routing_direct_model_ignores_classifier() {
+        let mut config = test_config_with_fusion();
+        config.fusion.classifier = Some(crate::config::ClassifierConfig {
+            endpoint: "http://localhost:1234/v1".into(),
+            api_key: Some("test-key".into()),
+            model_id: "test-classifier".into(),
+            chat_path: None,
+            timeout_secs: 5,
+            simple_target: "model-b".into(),
+        });
+
+        let guard = FusionGuard { is_subrequest: false };
+        let req = ChatCompletionRequest {
+            model: "gpt-4o".into(),
+            messages: vec![Message::user("hi")],
+            stream: false,
+            session_id: None,
+            workspace: None,
+            tools: None,
+            raw_body: json!({}),
+        };
+        let budget = BudgetManager::new(Default::default());
+        let decision = decide_route(&guard, &req, &config, &budget);
+        assert!(
+            !matches!(decision, RoutingDecision::NeedsClassification { .. }),
+            "Direct model name should not trigger classification",
+        );
     }
 }

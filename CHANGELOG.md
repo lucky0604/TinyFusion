@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1.0] - 2026-06-26
+
+### Added
+- AI complexity classifier: configurable pre-classification of `model: "tinyfusion"` requests before MoA pipeline. Simple requests (greetings, short questions) are forwarded directly to a fast model (~2-3s), only complex requests go through full MoA deliberation (~60-90s)
+- `ClassifierConfig` with independent endpoint/api_key/model_id fields (no dependency on fusion.models registry)
+- Settings page: AI Complexity Classifier toggle with endpoint, API key, model ID, chat path, timeout, and simple target configuration
+- Classifier gracefully falls back to MoA when: classification fails/times out, simple_target model not found in fusion.models, or classifier not configured
+- `/v1/config` endpoint now exposes `fusion.classifier` configuration
+
+### Fixed
+- Classifier handler reuses shared `reqwest::Client` from `AppState` instead of creating a new connection pool per request
+- Settings chat_path field clears to `undefined` (not empty string) to prevent broken URL construction
+
 ## [0.2.0.0] - 2026-06-26
 
 ### Added
