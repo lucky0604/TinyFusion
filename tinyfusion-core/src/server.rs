@@ -95,6 +95,7 @@ async fn get_config(
             "models": fusion_models,
             "routing": config.fusion.routing,
             "budget": config.fusion.budget,
+            "classifier": config.fusion.classifier,
         },
     }))
 }

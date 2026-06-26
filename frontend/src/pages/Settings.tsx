@@ -8,6 +8,15 @@ interface WorkspaceConfig {
   max_retries: number
 }
 
+interface ClassifierConfig {
+  endpoint: string
+  api_key?: string
+  model_id: string
+  chat_path?: string
+  timeout_secs: number
+  simple_target: string
+}
+
 interface GlobalConfig {
   port: number
   workers: { name: string; endpoint: string; model_id: string }[]
@@ -15,6 +24,10 @@ interface GlobalConfig {
   executor: { name: string; endpoint: string; model_id: string }
   workspaces: Record<string, WorkspaceConfig>
   error_keywords: string[]
+  fusion?: {
+    classifier?: ClassifierConfig | null
+    [key: string]: unknown
+  }
 }
 
 function defaultConfig(): GlobalConfig {
@@ -40,11 +53,15 @@ export function Settings() {
   const [newWsName, setNewWsName] = useState('')
   const [newWsPath, setNewWsPath] = useState('')
   const [newWsCmd] = useState('cargo build && cargo test')
+  const [classifierEnabled, setClassifierEnabled] = useState(false)
 
   useEffect(() => {
     if (typeof window !== 'undefined' && (window as any).__TAURI__) {
       tauriInvoke('get_config').then((c: Partial<GlobalConfig>) => {
-        if (c) setConfig({ ...defaultConfig(), ...c })
+        if (c) {
+          setConfig({ ...defaultConfig(), ...c })
+          setClassifierEnabled(!!c.fusion?.classifier)
+        }
       }).catch(() => {})
     }
   }, [])
@@ -94,6 +111,37 @@ export function Settings() {
         [name]: { ...config.workspaces[name], [field]: value },
       },
     })
+  }
+
+  const defaultClassifier: ClassifierConfig = {
+    endpoint: 'http://localhost:11434/v1',
+    model_id: '',
+    timeout_secs: 5,
+    simple_target: '',
+  }
+
+  const classifier = config.fusion?.classifier ?? defaultClassifier
+
+  const updateClassifier = (field: keyof ClassifierConfig, value: string | number) => {
+    const updated = { ...classifier, [field]: value }
+    setConfig({
+      ...config,
+      fusion: { ...config.fusion, classifier: updated },
+    })
+  }
+
+  const toggleClassifier = (enabled: boolean) => {
+    setClassifierEnabled(enabled)
+    if (enabled) {
+      setConfig({
+        ...config,
+        fusion: { ...config.fusion, classifier: config.fusion?.classifier ?? defaultClassifier },
+      })
+    } else {
+      const fusion = { ...config.fusion }
+      delete fusion.classifier
+      setConfig({ ...config, fusion })
+    }
   }
 
   return (
@@ -200,6 +248,94 @@ export function Settings() {
             <Plus size={16} /> Add
           </button>
         </div>
+      </section>
+
+      <section className="mb-8">
+        <div className="flex items-center justify-between mb-3">
+          <h2 className="text-sm font-semibold text-[var(--text-primary)] uppercase tracking-wider">AI Complexity Classifier</h2>
+          <label className="flex items-center gap-2 cursor-pointer">
+            <span className="text-xs text-[var(--text-secondary)]">{classifierEnabled ? 'Enabled' : 'Disabled'}</span>
+            <button
+              onClick={() => toggleClassifier(!classifierEnabled)}
+              className={`relative w-9 h-5 rounded-full transition-colors ${classifierEnabled ? 'bg-[var(--accent-primary)]' : 'bg-[var(--bg-tertiary)] border border-[var(--border-primary)]'}`}
+            >
+              <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform ${classifierEnabled ? 'translate-x-4' : 'translate-x-0.5'}`} />
+            </button>
+          </label>
+        </div>
+        <p className="text-xs text-[var(--text-secondary)] mb-3">
+          Pre-classify incoming requests to skip the full MoA pipeline for simple questions. Simple requests are forwarded directly to a fast model.
+        </p>
+        {classifierEnabled && (
+          <div className="space-y-3 p-3 rounded-md bg-[var(--bg-tertiary)] border border-[var(--border-primary)]">
+            <div>
+              <label className="block text-xs text-[var(--text-tertiary)] mb-0.5">Endpoint URL</label>
+              <input
+                value={classifier.endpoint}
+                onChange={(e) => updateClassifier('endpoint', e.target.value)}
+                placeholder="https://api.example.com/v1"
+                className="w-full h-9 px-3 rounded-md bg-[var(--bg-secondary)] border border-[var(--border-primary)] text-[var(--text-primary)] text-sm focus:outline-none focus:border-[var(--border-focus)]"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-[var(--text-tertiary)] mb-0.5">API Key</label>
+              <input
+                type="password"
+                value={classifier.api_key ?? ''}
+                onChange={(e) => updateClassifier('api_key', e.target.value)}
+                placeholder="sk-..."
+                className="w-full h-9 px-3 rounded-md bg-[var(--bg-secondary)] border border-[var(--border-primary)] text-[var(--text-primary)] text-sm focus:outline-none focus:border-[var(--border-focus)]"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-[var(--text-tertiary)] mb-0.5">Model ID</label>
+              <input
+                value={classifier.model_id}
+                onChange={(e) => updateClassifier('model_id', e.target.value)}
+                placeholder="qwen3-8b"
+                className="w-full h-9 px-3 rounded-md bg-[var(--bg-secondary)] border border-[var(--border-primary)] text-[var(--text-primary)] text-sm focus:outline-none focus:border-[var(--border-focus)]"
+              />
+            </div>
+            <div>
+              <label className="block text-xs text-[var(--text-tertiary)] mb-0.5">Chat Path (optional, for non-standard APIs)</label>
+              <input
+                value={classifier.chat_path ?? ''}
+                onChange={(e) => {
+                  const v = e.target.value.trim()
+                  if (v) {
+                    updateClassifier('chat_path', v)
+                  } else {
+                    const updated = { ...classifier }
+                    delete updated.chat_path
+                    setConfig({ ...config, fusion: { ...config.fusion, classifier: updated } })
+                  }
+                }}
+                placeholder="/v1/chat/completions"
+                className="w-full h-9 px-3 rounded-md bg-[var(--bg-secondary)] border border-[var(--border-primary)] text-[var(--text-primary)] text-sm focus:outline-none focus:border-[var(--border-focus)]"
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="block text-xs text-[var(--text-tertiary)] mb-0.5">Timeout (seconds)</label>
+                <input
+                  type="number"
+                  value={classifier.timeout_secs}
+                  onChange={(e) => updateClassifier('timeout_secs', parseInt(e.target.value) || 5)}
+                  className="w-full h-9 px-3 rounded-md bg-[var(--bg-secondary)] border border-[var(--border-primary)] text-[var(--text-primary)] text-sm focus:outline-none focus:border-[var(--border-focus)]"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-[var(--text-tertiary)] mb-0.5">Simple Target Model</label>
+                <input
+                  value={classifier.simple_target}
+                  onChange={(e) => updateClassifier('simple_target', e.target.value)}
+                  placeholder="deepseek-v4-flash"
+                  className="w-full h-9 px-3 rounded-md bg-[var(--bg-secondary)] border border-[var(--border-primary)] text-[var(--text-primary)] text-sm focus:outline-none focus:border-[var(--border-focus)]"
+                />
+              </div>
+            </div>
+          </div>
+        )}
       </section>
 
       <section className="mb-8">
