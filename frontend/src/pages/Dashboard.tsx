@@ -1,8 +1,15 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { ChevronDown, ArrowDown } from 'lucide-react'
+import { ChevronDown, ArrowDown, Zap } from 'lucide-react'
 
 type SessionState = 'Diagnostic' | 'Execution' | 'Verify' | 'Done'
 type LogPhase = 'diag' | 'exec' | 'veri' | 'retry' | 'info'
+
+interface BudgetSnapshot {
+  daily_tokens: number
+  daily_limit: number
+  monthly_tokens: number
+  monthly_limit: number
+}
 
 interface LogEntry {
   id: string
@@ -43,6 +50,72 @@ const PHASE_COLORS: Record<LogPhase, { bg: string; text: string; border: string 
   veri: { bg: 'rgba(245,158,11,0.1)', text: 'var(--status-warning)', border: 'rgba(245,158,11,0.3)' },
   retry: { bg: 'rgba(239,68,68,0.1)', text: 'var(--status-error)', border: 'rgba(239,68,68,0.3)' },
   info: { bg: 'var(--bg-tertiary)', text: 'var(--text-secondary)', border: 'var(--border-primary)' },
+}
+
+function formatTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
+  return String(n)
+}
+
+function BudgetCard({ budget }: { budget: BudgetSnapshot | null }) {
+  if (!budget) return null
+
+  const dailyPct = budget.daily_limit > 0
+    ? Math.min(100, (budget.daily_tokens / budget.daily_limit) * 100)
+    : 0
+  const monthlyPct = budget.monthly_limit > 0
+    ? Math.min(100, (budget.monthly_tokens / budget.monthly_limit) * 100)
+    : 0
+
+  const barColor = (pct: number) =>
+    pct >= 90 ? 'var(--status-error)' :
+    pct >= 70 ? 'var(--status-warning)' :
+    'var(--accent-primary)'
+
+  return (
+    <div style={{
+      background: 'var(--bg-secondary)', border: '1px solid var(--border-subtle)',
+      borderRadius: 'var(--radius-lg)', padding: 20, marginBottom: 24,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
+        <Zap size={16} style={{ color: 'var(--accent-primary)' }} />
+        <h3 style={{ fontSize: '0.9375rem', fontWeight: 600, color: 'var(--text-primary)' }}>Token Budget</h3>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+        {/* Daily */}
+        <div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+            <span style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)' }}>Daily</span>
+            <span style={{ fontSize: '0.8125rem', fontFamily: 'var(--font-mono)', color: 'var(--text-primary)' }}>
+              {formatTokens(budget.daily_tokens)}
+              {budget.daily_limit > 0 ? ` / ${formatTokens(budget.daily_limit)}` : ' (unlimited)'}
+            </span>
+          </div>
+          {budget.daily_limit > 0 && (
+            <div style={{ height: 6, borderRadius: 3, background: 'var(--bg-tertiary)', overflow: 'hidden' }}>
+              <div style={{ width: `${dailyPct}%`, height: '100%', borderRadius: 3, background: barColor(dailyPct), transition: 'width 300ms ease' }} />
+            </div>
+          )}
+        </div>
+        {/* Monthly */}
+        <div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+            <span style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)' }}>Monthly</span>
+            <span style={{ fontSize: '0.8125rem', fontFamily: 'var(--font-mono)', color: 'var(--text-primary)' }}>
+              {formatTokens(budget.monthly_tokens)}
+              {budget.monthly_limit > 0 ? ` / ${formatTokens(budget.monthly_limit)}` : ' (unlimited)'}
+            </span>
+          </div>
+          {budget.monthly_limit > 0 && (
+            <div style={{ height: 6, borderRadius: 3, background: 'var(--bg-tertiary)', overflow: 'hidden' }}>
+              <div style={{ width: `${monthlyPct}%`, height: '100%', borderRadius: 3, background: barColor(monthlyPct), transition: 'width 300ms ease' }} />
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
 }
 
 function SessionCard({ session, onEnd }: { session: SessionInfo; onEnd: (id: string) => void }) {
@@ -135,6 +208,14 @@ function LogPanel({ entries }: { entries: LogEntry[] }) {
 export function Dashboard() {
   const [sessions, setSessions] = useState<SessionInfo[]>([])
   const [logEntries, setLogEntries] = useState<LogEntry[]>([])
+  const [budget, setBudget] = useState<BudgetSnapshot | null>(null)
+
+  const fetchBudget = () => {
+    fetch('http://localhost:9999/v1/budget')
+      .then(res => res.json())
+      .then(data => setBudget(data))
+      .catch(() => {})
+  }
 
   const fetchSessions = () => {
     fetch('http://localhost:9999/v1/sessions')
@@ -171,7 +252,9 @@ export function Dashboard() {
 
   useEffect(() => {
     fetchSessions()
+    fetchBudget()
     const interval = setInterval(fetchSessions, 3000)
+    const budgetInterval = setInterval(fetchBudget, 5000)
 
     // 1. 先加载部分初始历史日志（来自 metrics）
     fetch('http://localhost:9999/v1/metrics')
@@ -222,6 +305,7 @@ export function Dashboard() {
 
     return () => {
       clearInterval(interval)
+      clearInterval(budgetInterval)
       eventSource.close()
     }
   }, [])
@@ -239,6 +323,7 @@ export function Dashboard() {
         </div>
       </div>
       <div style={{ flex: 1, overflowY: 'auto', padding: 24 }}>
+        <BudgetCard budget={budget} />
         {sessions.length === 0 ? (
           <div style={{ padding: '40px 0', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: '0.8125rem', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-lg)', border: '1px dashed var(--border-primary)', marginBottom: 24 }}>
             No Active Sessions<br />

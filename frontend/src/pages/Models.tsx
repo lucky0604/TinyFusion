@@ -1,9 +1,10 @@
 import { useState, useEffect, useRef } from 'react'
 import { Plus, Copy, Pencil, Trash2, Check, X, Eye, EyeOff } from 'lucide-react'
 
-type ModelProvider = 'ollama' | 'openai' | 'anthropic' | 'deepseek' | 'custom'
+type ModelProvider = 'ollama' | 'openai' | 'anthropic' | 'deepseek' | 'zhipu' | 'local' | 'custom'
 type ConnectionStatus = 'connected' | 'error' | 'testing' | 'untested'
 type ModelRole = 'workers' | 'judge' | 'executor'
+type ModelTier = 'simple' | 'medium' | 'complex'
 
 interface ModelConfig {
   id: string
@@ -13,6 +14,19 @@ interface ModelConfig {
   modelId: string
   apiKey?: string
   role: ModelRole
+  status: ConnectionStatus
+  errorMessage?: string
+}
+
+interface FusionModelEntry {
+  name: string
+  provider: string
+  endpoint: string
+  modelId: string
+  apiKey?: string
+  tier?: ModelTier
+  isLocal?: boolean
+  chatPath?: string
   status: ConnectionStatus
   errorMessage?: string
 }
@@ -28,6 +42,12 @@ interface GlobalSettings {
   verifyTimeout: number
   keepCoreRunning: boolean
   workspaces: WorkspaceEntry[]
+}
+
+const TIER_CONFIG: Record<ModelTier, { label: string; color: string; bg: string }> = {
+  simple: { label: 'Simple', color: 'var(--status-active)', bg: 'rgba(34,197,94,0.1)' },
+  medium: { label: 'Medium', color: 'var(--status-warning)', bg: 'rgba(245,158,11,0.1)' },
+  complex: { label: 'Complex', color: 'var(--accent-primary)', bg: 'rgba(99,102,241,0.1)' },
 }
 
 const ROLE_CONFIG: Record<ModelRole, { title: string; description: string; borderColor: string }> = {
@@ -53,6 +73,8 @@ const PROVIDER_DEFAULTS: Record<ModelProvider, { endpoint: string; needsKey: boo
   openai: { endpoint: 'https://api.openai.com/v1', needsKey: true },
   anthropic: { endpoint: 'https://api.anthropic.com/v1', needsKey: true },
   deepseek: { endpoint: 'https://api.deepseek.com/v1', needsKey: true },
+  zhipu: { endpoint: 'https://open.bigmodel.cn', needsKey: true },
+  local: { endpoint: 'http://localhost:8080/v1', needsKey: false },
   custom: { endpoint: '', needsKey: false },
 }
 
@@ -61,6 +83,8 @@ const PROVIDER_LABELS: Record<ModelProvider, string> = {
   openai: 'OpenAI',
   anthropic: 'Anthropic',
   deepseek: 'DeepSeek',
+  zhipu: 'Zhipu (GLM)',
+  local: 'Local GPU',
   custom: 'Custom',
 }
 
@@ -550,6 +574,7 @@ function RoleSection({
 
 export function Models() {
   const [models, setModels] = useState<ModelConfig[]>([])
+  const [fusionModels, setFusionModels] = useState<FusionModelEntry[]>([])
   const fullConfig = useRef<any>(null)
   const [configLoaded, setConfigLoaded] = useState(false)
   const [dialogOpen, setDialogOpen] = useState(false)
@@ -561,19 +586,46 @@ export function Models() {
   const [newWsPath, setNewWsPath] = useState('')
   const [newWsCmd, setNewWsCmd] = useState('')
 
-  // Load config from disk on mount
+  // Load config: try HTTP API first, then Tauri IPC fallback
   useEffect(() => {
-    if (typeof window !== 'undefined' && (window as any).__TAURI__) {
-      tauriInvoke('get_config').then((config: any) => {
+    const loadConfig = async () => {
+      try {
+        const res = await fetch('http://localhost:9999/v1/config')
+        const config = await res.json()
         fullConfig.current = config
         setModels(configToModels(config))
+        // Load fusion models
+        if (config.fusion?.models) {
+          const entries: FusionModelEntry[] = Object.entries(config.fusion.models).map(
+            ([name, entry]: [string, Record<string, unknown>]) => ({
+              name,
+              provider: (entry.provider as string) || 'custom',
+              endpoint: entry.endpoint as string,
+              modelId: entry.model_id as string,
+              apiKey: (entry.api_key as string) || undefined,
+              tier: (entry.tier as ModelTier) || undefined,
+              isLocal: (entry.is_local as boolean) || false,
+              chatPath: (entry.chat_path as string) || undefined,
+              status: 'untested' as ConnectionStatus,
+            })
+          )
+          setFusionModels(entries)
+        }
         setConfigLoaded(true)
-      }).catch(() => {
-        setConfigLoaded(true)
-      })
-    } else {
-      setConfigLoaded(true)
+      } catch {
+        // Fallback to Tauri IPC
+        if (typeof window !== 'undefined' && (window as any).__TAURI__) {
+          tauriInvoke('get_config').then((config: any) => {
+            fullConfig.current = config
+            setModels(configToModels(config))
+            setConfigLoaded(true)
+          }).catch(() => setConfigLoaded(true))
+        } else {
+          setConfigLoaded(true)
+        }
+      }
     }
+    loadConfig()
   }, [])
 
   // Persist models to config.json after every change
@@ -670,7 +722,100 @@ export function Models() {
         </h1>
       </div>
 
-      {models.length === 0 ? (
+      {/* Fusion Models Registry (v2) */}
+      {fusionModels.length > 0 && (
+        <div style={{
+          background: 'var(--bg-secondary)', border: '1px solid var(--border-subtle)',
+          borderRadius: 'var(--radius-lg)', padding: 20,
+          borderLeft: '3px solid rgba(99,102,241,0.4)', marginBottom: 32,
+        }}>
+          <div style={{ marginBottom: 16 }}>
+            <h3 style={{ fontSize: '0.9375rem', fontWeight: 600, color: 'var(--text-primary)' }}>
+              Smart Routing Models
+            </h3>
+            <p style={{ fontSize: '0.8125rem', color: 'var(--text-secondary)', marginTop: 2 }}>
+              Models registered for complexity-based routing. Configure in config.json → fusion.models
+            </p>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {fusionModels.map((m) => {
+              const tierCfg = m.tier ? TIER_CONFIG[m.tier] : null
+              return (
+                <div key={m.name} style={{
+                  background: 'var(--bg-primary)', border: '1px solid var(--border-subtle)',
+                  borderRadius: 'var(--radius-lg)', padding: 16,
+                }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <span style={{ fontWeight: 600, fontSize: '0.9375rem', color: 'var(--text-primary)' }}>
+                          {m.name}
+                        </span>
+                        {m.isLocal && (
+                          <span style={{
+                            fontSize: '0.6875rem', fontWeight: 600, padding: '2px 8px',
+                            borderRadius: 'var(--radius-full)',
+                            background: 'rgba(34,197,94,0.1)', color: 'var(--status-active)',
+                            border: '1px solid rgba(34,197,94,0.2)',
+                          }}>LOCAL</span>
+                        )}
+                        {tierCfg && (
+                          <span style={{
+                            fontSize: '0.6875rem', fontWeight: 600, padding: '2px 8px',
+                            borderRadius: 'var(--radius-full)',
+                            background: tierCfg.bg, color: tierCfg.color,
+                          }}>{tierCfg.label}</span>
+                        )}
+                      </div>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8125rem', color: 'var(--text-secondary)', marginTop: 2 }}>
+                        {m.provider}/{m.modelId}
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <ModelStatusDot status={m.status} />
+                      <button onClick={async () => {
+                        setFusionModels(prev => prev.map(fm => fm.name === m.name ? { ...fm, status: 'testing' } : fm))
+                        try {
+                          const url = m.chatPath
+                            ? `${m.endpoint.replace(/\/$/, '')}${m.chatPath}`
+                            : `${m.endpoint.replace(/\/$/, '')}/chat/completions`
+                          const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+                          if (m.apiKey) headers['Authorization'] = `Bearer ${m.apiKey}`
+                          const resp = await fetch(url, {
+                            method: 'POST', headers,
+                            body: JSON.stringify({ model: m.modelId, messages: [{ role: 'user', content: 'test' }], max_tokens: 1 }),
+                            signal: AbortSignal.timeout(10000),
+                          })
+                          setFusionModels(prev => prev.map(fm =>
+                            fm.name === m.name ? { ...fm, status: resp.ok ? 'connected' : 'error', errorMessage: resp.ok ? undefined : `HTTP ${resp.status}` } : fm
+                          ))
+                        } catch (e) {
+                          setFusionModels(prev => prev.map(fm =>
+                            fm.name === m.name ? { ...fm, status: 'error', errorMessage: (e as Error).message } : fm
+                          ))
+                        }
+                      }} style={{
+                        padding: '4px 10px', fontSize: '0.75rem',
+                        background: 'var(--bg-tertiary)', border: '1px solid var(--border-primary)',
+                        borderRadius: 'var(--radius-md)', color: 'var(--text-primary)', cursor: 'pointer',
+                      }}>Test</button>
+                    </div>
+                  </div>
+                  <div style={{ fontSize: '0.75rem', color: 'var(--text-tertiary)', fontFamily: 'var(--font-mono)' }}>
+                    {m.endpoint}{m.chatPath || '/chat/completions'}
+                  </div>
+                  {m.status === 'error' && m.errorMessage && (
+                    <div style={{ fontSize: '0.75rem', color: 'var(--status-error)', marginTop: 4 }}>{m.errorMessage}</div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Legacy Models (v1) */}
+      {models.length === 0 && fusionModels.length === 0 ? (
         <div style={{
           textAlign: 'center', padding: '64px 0', background: 'var(--bg-secondary)',
           border: '1px solid var(--border-subtle)', borderRadius: 'var(--radius-lg)',
@@ -679,16 +824,21 @@ export function Models() {
           <h2 style={{ fontSize: '1.125rem', fontWeight: 600, marginBottom: 8 }}>No Models Configured Yet</h2>
           <p style={{ color: 'var(--text-secondary)', marginBottom: 6 }}>Add your first model to start using the AI gateway.</p>
           <p style={{ color: 'var(--text-tertiary)', fontSize: '0.8125rem' }}>
-            You'll need at minimum: 1 Executor (fast model) · For Fusion: 2+ Workers + 1 Judge
+            Configure in ~/.tinyfusion/config.json → fusion.models
           </p>
         </div>
-      ) : (
+      ) : models.length > 0 ? (
         <>
-          <RoleSection role="workers" models={filteredRole('workers')} onAdd={() => handleAdd('workers')} onEdit={handleEdit} onDelete={handleDelete} onTest={handleTest} />
-          <RoleSection role="judge" models={filteredRole('judge')} onAdd={() => handleAdd('judge')} onEdit={handleEdit} onDelete={handleDelete} onTest={handleTest} />
-          <RoleSection role="executor" models={filteredRole('executor')} onAdd={() => handleAdd('executor')} onEdit={handleEdit} onDelete={handleDelete} onTest={handleTest} />
+          <details style={{ marginBottom: 32 }}>
+            <summary style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)', cursor: 'pointer', marginBottom: 16 }}>
+              Legacy Models (workers/judge/executor)
+            </summary>
+            <RoleSection role="workers" models={filteredRole('workers')} onAdd={() => handleAdd('workers')} onEdit={handleEdit} onDelete={handleDelete} onTest={handleTest} />
+            <RoleSection role="judge" models={filteredRole('judge')} onAdd={() => handleAdd('judge')} onEdit={handleEdit} onDelete={handleDelete} onTest={handleTest} />
+            <RoleSection role="executor" models={filteredRole('executor')} onAdd={() => handleAdd('executor')} onEdit={handleEdit} onDelete={handleDelete} onTest={handleTest} />
+          </details>
         </>
-      )}
+      ) : null}
 
       <div style={{
         background: 'var(--bg-secondary)', border: '1px solid var(--border-subtle)',
