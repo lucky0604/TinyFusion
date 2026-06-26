@@ -162,9 +162,9 @@ pub struct PanelResponse {
     pub token_count: Option<u64>,
 }
 
-/// Fusion pipeline metrics for a single request lifecycle.
+/// Pipeline metrics for a single request lifecycle.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FusionMetrics {
+pub struct RequestMetrics {
     pub request_id: String,
     pub timestamp: u64,
     pub request_type: String,
