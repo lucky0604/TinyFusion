@@ -14,6 +14,15 @@ pub struct ModelConfig {
     pub api_key: Option<String>,
 }
 
+/// Complexity tier for smart routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelTier {
+    Simple,
+    Medium,
+    Complex,
+}
+
 /// A model entry in the Unified Model Registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelEntry {
@@ -22,6 +31,69 @@ pub struct ModelEntry {
     pub model_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Complexity tier this model is assigned to (for smart routing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<ModelTier>,
+    /// Whether this model runs locally (zero cost for budget tracking).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_local: Option<bool>,
+    /// Custom chat completions path (e.g. "/api/paas/v4/chat/completions" for Zhipu).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_path: Option<String>,
+}
+
+/// Smart routing thresholds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingConfig {
+    /// Minimum message length (chars) to consider Medium complexity.
+    #[serde(default = "default_medium_threshold")]
+    pub medium_threshold: usize,
+    /// Minimum message length (chars) to consider Complex.
+    #[serde(default = "default_complex_threshold")]
+    pub complex_threshold: usize,
+    /// File mention count threshold for Complex.
+    #[serde(default = "default_file_mention_threshold")]
+    pub file_mention_threshold: usize,
+}
+
+fn default_medium_threshold() -> usize { 200 }
+fn default_complex_threshold() -> usize { 800 }
+fn default_file_mention_threshold() -> usize { 3 }
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            medium_threshold: default_medium_threshold(),
+            complex_threshold: default_complex_threshold(),
+            file_mention_threshold: default_file_mention_threshold(),
+        }
+    }
+}
+
+/// Token budget limits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetConfig {
+    /// Daily cloud token limit (0 = unlimited).
+    #[serde(default)]
+    pub daily_limit: u64,
+    /// Monthly cloud token limit (0 = unlimited).
+    #[serde(default)]
+    pub monthly_limit: u64,
+    /// How often to persist budget state to disk (seconds).
+    #[serde(default = "default_persist_interval")]
+    pub persist_interval_secs: u64,
+}
+
+fn default_persist_interval() -> u64 { 60 }
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            daily_limit: 0,
+            monthly_limit: 0,
+            persist_interval_secs: default_persist_interval(),
+        }
+    }
 }
 
 /// Fusion deliberation pipeline configuration.
@@ -45,6 +117,12 @@ pub struct FusionConfig {
     pub enable_fact_check: bool,
     #[serde(default)]
     pub enable_self_healing: bool,
+    /// Smart routing configuration.
+    #[serde(default)]
+    pub routing: Option<RoutingConfig>,
+    /// Token budget configuration.
+    #[serde(default)]
+    pub budget: Option<BudgetConfig>,
 }
 
 fn default_outer_model() -> String {
@@ -68,6 +146,8 @@ impl Default for FusionConfig {
             enable_debate: false,
             enable_fact_check: false,
             enable_self_healing: false,
+            routing: None,
+            budget: None,
         }
     }
 }
@@ -220,6 +300,9 @@ impl Config {
             config.port
         );
 
+        // v1→v2 migration warnings
+        config.warn_missing_v2_fields();
+
         Ok(config)
     }
 
@@ -231,6 +314,44 @@ impl Config {
     /// Count total configured model entries (workers + judge + executor).
     pub fn model_count(&self) -> usize {
         self.workers.len() + 1 /* judge */ + 1 /* executor */
+    }
+
+    /// Check for missing v2 configuration fields and log helpful warnings.
+    fn warn_missing_v2_fields(&self) {
+        let mut missing = Vec::new();
+
+        if self.fusion.routing.is_none() {
+            missing.push("fusion.routing");
+        }
+        if self.fusion.budget.is_none() {
+            missing.push("fusion.budget");
+        }
+
+        let models_without_tier = self
+            .fusion
+            .models
+            .iter()
+            .filter(|(_, e)| e.tier.is_none())
+            .count();
+        if models_without_tier > 0 {
+            tracing::warn!(
+                "[Config v2] {} fusion model(s) have no 'tier' field — smart routing will use Medium as default",
+                models_without_tier
+            );
+        }
+
+        if !missing.is_empty() {
+            tracing::warn!(
+                "[Config v2] Missing optional sections: {}. \
+                 Smart routing and budget tracking are disabled. \
+                 Add to config.json to enable:\n\
+                 \"fusion\": {{\n  \
+                   \"routing\": {{ \"medium_threshold\": 200, \"complex_threshold\": 800, \"file_mention_threshold\": 3 }},\n  \
+                   \"budget\": {{ \"daily_limit\": 500000, \"monthly_limit\": 5000000, \"persist_interval_secs\": 60 }}\n\
+                 }}",
+                missing.join(", ")
+            );
+        }
     }
 }
 
@@ -435,6 +556,9 @@ mod tests {
             endpoint: "http://localhost:1".into(),
             model_id: "m1-id".into(),
             api_key: Some("k1".into()),
+            tier: None,
+            is_local: None,
+            chat_path: None,
         });
         let entry = config.fusion.get_model("m1");
         assert!(entry.is_some());
@@ -467,5 +591,129 @@ mod tests {
         let config = Config::default_config();
         assert_eq!(config.fusion.timeout_seconds, 30);
         assert!(config.fusion.models.is_empty());
+    }
+
+    #[test]
+    fn test_v1_config_backward_compat() {
+        // A v1 config without any fusion.routing/budget/tier fields should load fine
+        let json = serde_json::json!({
+            "port": 9999,
+            "workers": [],
+            "judge": {"name": "j", "endpoint": "http://localhost:11434", "model_id": "m"},
+            "executor": {"name": "e", "endpoint": "http://localhost:11434", "model_id": "m"},
+            "workspaces": {},
+            "fusion": {
+                "models": {
+                    "model-a": {
+                        "provider": "openai",
+                        "endpoint": "http://localhost:1234/v1",
+                        "model_id": "gpt-4o",
+                        "api_key": "sk-test"
+                    }
+                }
+            }
+        });
+
+        let (path, dir) = write_config_temp(&json.to_string());
+        let config = Config::load(&path).unwrap();
+        assert!(config.fusion.routing.is_none());
+        assert!(config.fusion.budget.is_none());
+        let entry = config.fusion.get_model("model-a").unwrap();
+        assert!(entry.tier.is_none());
+        assert!(entry.is_local.is_none());
+        assert!(entry.chat_path.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_v2_config_with_routing_and_budget() {
+        let json = serde_json::json!({
+            "port": 9999,
+            "workers": [],
+            "judge": {"name": "j", "endpoint": "http://localhost:11434", "model_id": "m"},
+            "executor": {"name": "e", "endpoint": "http://localhost:11434", "model_id": "m"},
+            "workspaces": {},
+            "fusion": {
+                "routing": {
+                    "medium_threshold": 300,
+                    "complex_threshold": 1000,
+                    "file_mention_threshold": 5
+                },
+                "budget": {
+                    "daily_limit": 500000,
+                    "monthly_limit": 5000000,
+                    "persist_interval_secs": 120
+                },
+                "models": {
+                    "qwythos": {
+                        "provider": "local",
+                        "endpoint": "http://gpu:8080/v1",
+                        "model_id": "qwythos-9b",
+                        "tier": "simple",
+                        "is_local": true
+                    },
+                    "deepseek": {
+                        "provider": "deepseek",
+                        "endpoint": "https://api.deepseek.com/v1",
+                        "model_id": "deepseek-chat",
+                        "api_key": "sk-ds",
+                        "tier": "medium"
+                    }
+                }
+            }
+        });
+
+        let (path, dir) = write_config_temp(&json.to_string());
+        let config = Config::load(&path).unwrap();
+
+        let routing = config.fusion.routing.as_ref().unwrap();
+        assert_eq!(routing.medium_threshold, 300);
+        assert_eq!(routing.complex_threshold, 1000);
+        assert_eq!(routing.file_mention_threshold, 5);
+
+        let budget = config.fusion.budget.as_ref().unwrap();
+        assert_eq!(budget.daily_limit, 500000);
+        assert_eq!(budget.monthly_limit, 5000000);
+
+        let qwythos = config.fusion.get_model("qwythos").unwrap();
+        assert_eq!(qwythos.tier, Some(ModelTier::Simple));
+        assert_eq!(qwythos.is_local, Some(true));
+
+        let deepseek = config.fusion.get_model("deepseek").unwrap();
+        assert_eq!(deepseek.tier, Some(ModelTier::Medium));
+        assert!(deepseek.is_local.is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_model_entry_chat_path() {
+        let json = serde_json::json!({
+            "provider": "zhipu",
+            "endpoint": "https://open.bigmodel.cn",
+            "model_id": "glm-5.2",
+            "api_key": "key",
+            "chat_path": "/api/paas/v4/chat/completions"
+        });
+
+        let entry: ModelEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            entry.chat_path.as_deref(),
+            Some("/api/paas/v4/chat/completions")
+        );
+    }
+
+    #[test]
+    fn test_model_tier_serialization() {
+        assert_eq!(
+            serde_json::to_string(&ModelTier::Simple).unwrap(),
+            "\"simple\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ModelTier::Complex).unwrap(),
+            "\"complex\""
+        );
+        let tier: ModelTier = serde_json::from_str("\"medium\"").unwrap();
+        assert_eq!(tier, ModelTier::Medium);
     }
 }
