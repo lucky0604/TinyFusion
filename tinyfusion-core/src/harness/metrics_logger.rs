@@ -47,7 +47,7 @@ impl HarnessTool for MetricsLogger {
 }
 
 /// Append a single metrics line to the JSONL file.
-fn append_metrics(metrics: &FusionMetrics) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn append_metrics(metrics: &FusionMetrics) -> Result<(), Box<dyn std::error::Error>> {
     let path = metrics_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

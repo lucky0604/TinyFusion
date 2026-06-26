@@ -67,6 +67,16 @@ impl SessionManager {
         }
     }
 
+    /// List all sessions.
+    pub fn list(&self) -> Vec<Session> {
+        self.sessions.lock().unwrap().values().cloned().collect()
+    }
+
+    /// Remove a session by id.
+    pub fn remove(&self, id: &str) -> Option<Session> {
+        self.sessions.lock().unwrap().remove(id)
+    }
+
     pub fn snapshot_path() -> std::path::PathBuf {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))

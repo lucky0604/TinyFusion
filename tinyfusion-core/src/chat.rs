@@ -337,7 +337,7 @@ fn decide_route(
         return RoutingDecision::SubrequestPassthrough;
     }
 
-    // 2. Model alias: tinyfusion/fusion
+    // 2. Model alias: tinyfusion
     if req.model == FUSION_MODEL_ALIAS {
         let panel_models = resolve_default_panel_models(config);
         return RoutingDecision::FusionPipeline(DeliberateArgs {
@@ -466,8 +466,27 @@ async fn handle_fusion_pipeline(
         .judge_model
         .unwrap_or_else(|| state.config.fusion.default_judge_model.clone());
 
+    // 联动 SessionManager: 创建/记录当前 Session，并将状态置为 Diagnostic
+    let sniffer_msgs: Vec<crate::sniffer::Message> = req.messages.iter().map(|m| {
+        crate::sniffer::Message {
+            role: m.role.clone(),
+            content: m.content_str().to_string(),
+        }
+    }).collect();
+
+    let (session_id, _) = state.session_manager.get_or_create(
+        req.session_id.clone().unwrap_or_else(|| request_id.clone()),
+        sniffer_msgs,
+    );
+    state.session_manager.set_state(&session_id, crate::session::SessionState::Diagnostic);
+
+    state.events.emit(
+        GatewayEvent::new("fusion", "Diagnostic phase started, spawning workers")
+            .with_session(&session_id)
+    );
+
     let mut ctx = PipelineContext::new(
-        request_id.clone(),
+        session_id.clone(),
         req.messages.clone(),
         panel_models,
         judge_model,
@@ -481,6 +500,9 @@ async fn handle_fusion_pipeline(
                 .as_ref()
                 .cloned()
                 .unwrap_or_default();
+
+            // 成功运行，跃迁为 Done
+            state.session_manager.set_state(&session_id, crate::session::SessionState::Done);
 
             let tool_output = serde_json::to_string_pretty(&analysis).unwrap_or_default();
 
@@ -519,6 +541,22 @@ async fn handle_passthrough(
     state: &AppState,
     req: &ChatCompletionRequest,
 ) -> Result<ChatResponse, (StatusCode, axum::Json<serde_json::Value>)> {
+    let session_id = req.session_id.clone().unwrap_or_else(|| generate_id());
+    let sniffer_msgs: Vec<crate::sniffer::Message> = req.messages.iter().map(|m| {
+        crate::sniffer::Message {
+            role: m.role.clone(),
+            content: m.content_str().to_string(),
+        }
+    }).collect();
+
+    // 联动 SessionManager: 始终创建并更新状态为 Execution，追加消息，使其在前端 Dashboard/Sessions 可见
+    let (actual_session_id, _) = state.session_manager.get_or_create(session_id, sniffer_msgs);
+    state.session_manager.set_state(&actual_session_id, crate::session::SessionState::Execution);
+    state.events.emit(
+        GatewayEvent::new("execution", "Execution phase started, forwarding to upstream model")
+            .with_session(&actual_session_id)
+    );
+
     // Try to find the model in fusion registry first
     let (upstream_url, model_id, api_key) = if let Some(entry) = state.config.fusion.get_model(&req.model) {
         (
@@ -541,17 +579,90 @@ async fn handle_passthrough(
         "stream": req.stream,
     });
 
+    let start_time = std::time::Instant::now();
+
     match forward_passthrough(&state.client, &upstream_url, &upstream_body, api_key.as_deref()).await {
         Ok((status, headers, body)) => {
+            let latency_ms = start_time.elapsed().as_millis() as u64;
+            state.session_manager.set_state(&actual_session_id, crate::session::SessionState::Done);
+            state.events.emit(
+                GatewayEvent::new("info", "Execution phase completed")
+                    .with_session(&actual_session_id)
+            );
+
+            // 为直通（Passthrough）请求记录并存储真实的指标日志，使其能够展示在 Logs 页面中
+            let metrics = crate::types::FusionMetrics {
+                request_id: actual_session_id.clone(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                total_latency_ms: latency_ms,
+                outer_model: req.model.clone(),
+                panel_models: vec![model_id.clone()],
+                judge_model: model_id.clone(),
+                panel_latencies_ms: vec![latency_ms],
+                judge_latency_ms: 0,
+                refiner_latency_ms: 0,
+                consensus_count: 0,
+                contradiction_count: 0,
+                blind_spot_count: 0,
+                panel_success_count: 1,
+                panel_failure_count: 0,
+            };
+
+            if let Err(e) = crate::harness::metrics_logger::append_metrics(&metrics) {
+                tracing::warn!("Failed to write passthrough metrics: {}", e);
+            }
+
             let mut response = axum::response::Response::new(body);
             *response.status_mut() = status;
             if let Some(ct) = headers.get("content-type") {
                 response.headers_mut().insert("content-type", ct.clone());
             }
+
+            // 添加标准的 SSE 流式响应标头，防止 Nginx/Tauri 等中间件对 SSE 块进行缓冲延迟，显著优化首 Token Latency
+            response.headers_mut().insert("cache-control", "no-cache".parse().unwrap());
+            response.headers_mut().insert("connection", "keep-alive".parse().unwrap());
+            response.headers_mut().insert("x-accel-buffering", "no".parse().unwrap());
+
             Ok(ChatResponse::Raw(response))
         }
         Err((status, error_msg)) => {
+            let latency_ms = start_time.elapsed().as_millis() as u64;
             tracing::error!("Passthrough failed: {}", error_msg);
+
+            state.session_manager.set_state(&actual_session_id, crate::session::SessionState::Done);
+            state.events.emit(
+                GatewayEvent::new("error", &format!("Execution phase failed: {}", error_msg))
+                    .with_session(&actual_session_id)
+            );
+
+            // 失败时记录失败指标
+            let metrics = crate::types::FusionMetrics {
+                request_id: actual_session_id.clone(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                total_latency_ms: latency_ms,
+                outer_model: req.model.clone(),
+                panel_models: vec![model_id.clone()],
+                judge_model: model_id.clone(),
+                panel_latencies_ms: vec![],
+                judge_latency_ms: 0,
+                refiner_latency_ms: 0,
+                consensus_count: 0,
+                contradiction_count: 0,
+                blind_spot_count: 0,
+                panel_success_count: 0,
+                panel_failure_count: 1,
+            };
+
+            if let Err(e) = crate::harness::metrics_logger::append_metrics(&metrics) {
+                tracing::warn!("Failed to write passthrough failure metrics: {}", e);
+            }
+
             Err((
                 status,
                 axum::Json(serde_json::json!({
@@ -939,7 +1050,7 @@ mod tests {
     fn test_routing_subrequest_passthrough() {
         let guard = FusionGuard { is_subrequest: true };
         let req = ChatCompletionRequest {
-            model: "tinyfusion/fusion".into(),
+            model: FUSION_MODEL_ALIAS.into(),
             messages: vec![Message::user("test")],
             stream: false,
             session_id: None,
@@ -955,7 +1066,7 @@ mod tests {
     fn test_routing_fusion_model_alias() {
         let guard = FusionGuard { is_subrequest: false };
         let req = ChatCompletionRequest {
-            model: "tinyfusion/fusion".into(),
+            model: FUSION_MODEL_ALIAS.into(),
             messages: vec![Message::user("test")],
             stream: false,
             session_id: None,
@@ -1077,7 +1188,7 @@ mod tests {
     async fn test_subrequest_header_forces_passthrough() {
         let resp = post_json_with_header(
             json!({
-                "model": "tinyfusion/fusion",
+                "model": FUSION_MODEL_ALIAS,
                 "messages": [{"role": "user", "content": "test"}]
             }),
             "x-tinyfusion-subrequest",
@@ -1187,7 +1298,7 @@ mod tests {
     async fn test_fusion_pipeline_error_returns_500() {
         // Fusion model alias with no fusion models configured → pipeline fails
         let resp = post_json(json!({
-            "model": "tinyfusion/fusion",
+            "model": FUSION_MODEL_ALIAS,
             "messages": [{"role": "user", "content": "test"}]
         }))
         .await;

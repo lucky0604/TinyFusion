@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { ChevronDown, ChevronRight, Clock, Activity, RefreshCw, CheckCircle2, XCircle } from 'lucide-react'
+import { useState, useEffect } from 'react'
+import { ChevronDown, ChevronRight, Clock, Activity, RefreshCw, CheckCircle2, XCircle, Trash2 } from 'lucide-react'
 
 type SessionState = 'Diagnostic' | 'Execution' | 'Verify' | 'Retry' | 'Done' | 'Failed'
 
@@ -25,31 +25,41 @@ const STATE_CONFIG: Record<SessionState, { label: string; color: string; icon: R
   Failed: { label: 'Failed', color: 'var(--status-error)', icon: <XCircle size={14} /> },
 }
 
-const MOCK_SESSIONS: SessionEntry[] = [
-  {
-    id: 'sess-a3f2e1', name: 'Fix auth null check', state: 'Done', retryCount: 0, maxRetries: 3,
-    workers: 'qwen2.5-coder:7b, deepseek-coder:6.7b', duration: '2m 34s', requests: 3, tokens: 4521,
-    createdAt: new Date(Date.now() - 3600000).toISOString(),
-  },
-  {
-    id: 'sess-b4d8c2', name: 'Debug test failures', state: 'Retry', retryCount: 2, maxRetries: 3,
-    workers: 'qwen2.5-coder:7b, codellama:7b', duration: '5m 12s', requests: 5, tokens: 8732,
-    createdAt: new Date(Date.now() - 1800000).toISOString(),
-  },
-  {
-    id: 'sess-c7e3f9', name: 'Refactor database layer', state: 'Execution', retryCount: 0, maxRetries: 3,
-    workers: 'deepseek-coder:6.7b', duration: '1m 08s', requests: 2, tokens: 2190,
-    createdAt: new Date(Date.now() - 600000).toISOString(),
-  },
-  {
-    id: 'sess-d2a5b0', name: 'Add rate limiter middleware', state: 'Diagnostic', retryCount: 0, maxRetries: 3,
-    workers: 'qwen2.5-coder:7b, deepseek-coder:6.7b, codellama:7b', duration: '0m 45s', requests: 1, tokens: 1240,
-    createdAt: new Date().toISOString(),
-  },
-]
-
 export function Sessions() {
+  const [sessions, setSessions] = useState<SessionEntry[]>([])
+  const [loading, setLoading] = useState(true)
   const [expandedId, setExpandedId] = useState<string | null>(null)
+
+  const fetchSessions = () => {
+    fetch('http://localhost:9999/v1/sessions')
+      .then((res) => res.json())
+      .then((data) => {
+        setSessions(data)
+        setLoading(false)
+      })
+      .catch((err) => {
+        console.error('Failed to fetch sessions:', err)
+        setLoading(false)
+      })
+  }
+
+  useEffect(() => {
+    fetchSessions()
+    const interval = setInterval(fetchSessions, 3000)
+    return () => clearInterval(interval)
+  }, [])
+
+  const endSession = async (id: string, e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (confirm('Are you sure you want to end this session?')) {
+      try {
+        await fetch(`http://localhost:9999/v1/sessions/${id}`, { method: 'DELETE' })
+        fetchSessions()
+      } catch (err) {
+        alert('Failed to end session: ' + err)
+      }
+    }
+  }
 
   return (
     <div className="p-6">
@@ -60,7 +70,9 @@ export function Sessions() {
         </div>
       </div>
 
-      {MOCK_SESSIONS.length === 0 ? (
+      {loading ? (
+        <div className="text-center py-20 text-sm text-[var(--text-secondary)]">Loading sessions...</div>
+      ) : sessions.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-20 text-center">
           <Activity size={48} className="text-[var(--text-tertiary)] mb-4" />
           <h2 className="text-lg font-medium text-[var(--text-primary)] mb-2">No Sessions</h2>
@@ -69,18 +81,18 @@ export function Sessions() {
         </div>
       ) : (
         <div className="space-y-2">
-          {MOCK_SESSIONS.map((session) => {
-            const stateCfg = STATE_CONFIG[session.state]
+          {sessions.map((session) => {
+            const stateCfg = STATE_CONFIG[session.state] || { label: session.state, color: 'var(--text-tertiary)', icon: null }
             const isExpanded = expandedId === session.id
 
             return (
               <div key={session.id} className="rounded-md border border-[var(--border-primary)] bg-[var(--bg-secondary)] overflow-hidden">
                 <button
                   onClick={() => setExpandedId(isExpanded ? null : session.id)}
-                  className="w-full flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-[var(--bg-hover)] transition-colors text-left"
+                  className="w-full flex items-center gap-3 px-4 py-3 cursor-pointer hover:bg-[var(--bg-hover)] transition-colors text-left font-sans"
                 >
                   <span className="flex-shrink-0">{isExpanded ? <ChevronDown size={16} className="text-[var(--text-secondary)]" /> : <ChevronRight size={16} className="text-[var(--text-secondary)]" />}</span>
-                  <span className="fw-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: stateCfg.color }} />
+                  <span className="w-2 h-2 rounded-full flex-shrink-0" style={{ backgroundColor: stateCfg.color }} />
                   <span className="font-medium text-sm text-[var(--text-primary)] flex-1 truncate">{session.name}</span>
                   <span className="text-xs px-2 py-0.5 rounded-full font-medium" style={{ backgroundColor: stateCfg.color + '20', color: stateCfg.color, border: '1px solid ' + stateCfg.color + '40' }}>
                     {session.state === 'Retry' ? `Retry ${session.retryCount}/${session.maxRetries}` : stateCfg.label}
@@ -88,6 +100,12 @@ export function Sessions() {
                   <span className="flex items-center gap-1 text-xs text-[var(--text-tertiary)]">
                     <Clock size={12} /> {session.duration}
                   </span>
+                  <button
+                    onClick={(e) => endSession(session.id, e)}
+                    className="p-1 hover:text-[var(--status-error)] transition-colors text-[var(--text-tertiary)] cursor-pointer"
+                  >
+                    <Trash2 size={14} />
+                  </button>
                 </button>
 
                 {isExpanded && (

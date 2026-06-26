@@ -47,7 +47,7 @@ const PHASE_COLORS: Record<LogPhase, { bg: string; text: string; border: string 
   info: { bg: 'var(--bg-tertiary)', text: 'var(--text-secondary)', border: 'var(--border-primary)' },
 }
 
-function SessionCard({ session }: { session: SessionInfo }) {
+function SessionCard({ session, onEnd }: { session: SessionInfo; onEnd: (id: string) => void }) {
   const cfg = STATE_CONFIG[session.state]
   const opacity = session.state === 'Done' ? 0.85 : 1
   const stateLabel = session.state === 'Retry' && session.retryCount !== undefined
@@ -84,9 +84,9 @@ function SessionCard({ session }: { session: SessionInfo }) {
       </div>
       <div style={{ marginTop: 'auto', paddingTop: 16 }}>
         {session.state === 'Failed' ? (
-          <button style={dangerBtnStyle}>Retry</button>
+          <button onClick={() => onEnd(session.id)} style={dangerBtnStyle}>Retry</button>
         ) : (
-          <button style={{ ...dangerBtnStyle, opacity: 0.7 }}>End Session</button>
+          <button onClick={() => onEnd(session.id)} style={{ ...dangerBtnStyle, opacity: 0.7 }}>End Session</button>
         )}
       </div>
     </div>
@@ -148,23 +148,98 @@ function LogPanel({ entries }: { entries: LogEntry[] }) {
 }
 
 export function Dashboard() {
-  const [logEntries] = useState<LogEntry[]>(() => {
-    const t = new Date().toISOString().slice(11, 19)
-    return [
-      { id: '1', timestamp: t, phase: 'diag', sessionId: 'session-a3f2', message: 'Diagnostic phase started, spawning 3 workers' },
-      { id: '2', timestamp: t, phase: 'diag', sessionId: 'session-a3f2', message: 'Worker qwen-coder responded' },
-      { id: '3', timestamp: t, phase: 'diag', sessionId: 'session-a3f2', message: 'Judge analyzing results...' },
-      { id: '4', timestamp: t, phase: 'exec', sessionId: 'session-a3f2', message: 'Passthrough → deepseek-chat' },
-      { id: '5', timestamp: t, phase: 'exec', sessionId: 'session-a3f2', message: 'Tool call: apply_changes' },
-      { id: '6', timestamp: t, phase: 'veri', sessionId: 'session-a3f2', message: 'Running: cargo build...' },
-    ]
-  })
+  const [sessions, setSessions] = useState<SessionInfo[]>([])
+  const [logEntries, setLogEntries] = useState<LogEntry[]>([])
 
-  const sessions: SessionInfo[] = [
-    { id: 'a3f2', sessionName: '#a3f2', state: 'Diagnostic', stats: { workers: 3, duration: '4.2s', requests: '1/∞', tokens: 1247 } },
-    { id: 'b7k1', sessionName: '#b7k1', state: 'Execution', stats: { workers: 0, duration: '2.1s', requests: '6/∞', tokens: 3420 } },
-    { id: 'c9m3', sessionName: '#c9m3', state: 'Verify', stats: { workers: 0, duration: '8.5s', requests: '3/∞', tokens: 2100 } },
-  ]
+  const fetchSessions = () => {
+    fetch('http://localhost:9999/v1/sessions')
+      .then((res) => res.json())
+      .then((data) => {
+        const mapped = data.map((s: { id: string; name: string; state: string; retryCount: number; maxRetries: number; duration: string; requests: number; tokens: number }) => ({
+          id: s.id,
+          sessionName: s.name,
+          state: s.state as SessionState,
+          retryCount: s.retryCount,
+          maxRetries: s.maxRetries,
+          stats: {
+            workers: s.state === 'Diagnostic' ? 2 : 0,
+            duration: s.duration,
+            requests: `${s.requests}/∞`,
+            tokens: s.tokens,
+          },
+        }))
+        setSessions(mapped)
+      })
+      .catch((err) => console.error('Failed to fetch sessions:', err))
+  }
+
+  const endSession = async (id: string) => {
+    if (confirm('Are you sure you want to end this session?')) {
+      try {
+        await fetch(`http://localhost:9999/v1/sessions/${id}`, { method: 'DELETE' })
+        fetchSessions()
+      } catch (e) {
+        alert('Failed to end session: ' + e)
+      }
+    }
+  }
+
+  useEffect(() => {
+    fetchSessions()
+    const interval = setInterval(fetchSessions, 3000)
+
+    // 1. 先加载部分初始历史日志（来自 metrics）
+    fetch('http://localhost:9999/v1/metrics')
+      .then((res) => res.json())
+      .then((data) => {
+        const logs = data.slice(-10).map((m: { request_id: string; timestamp: number; panel_failure_count: number; judge_model: string; total_latency_ms: number; consensus_count: number; contradiction_count: number }) => {
+          const date = new Date(m.timestamp * 1000)
+          return {
+            id: m.request_id + '-init',
+            timestamp: date.toTimeString().slice(0, 8),
+            phase: (m.panel_failure_count > 0 ? 'retry' : 'diag') as LogPhase,
+            sessionId: `session-${m.request_id.slice(0, 4)}`,
+            message: `Deliberation complete via ${m.judge_model}. Latency: ${m.total_latency_ms}ms. Consensus: ${m.consensus_count}, Contradictions: ${m.contradiction_count}`,
+          }
+        })
+        setLogEntries(logs)
+      })
+      .catch(() => {})
+
+    // 2. 然后建立 SSE 实时通道监听事件
+    const eventSource = new EventSource('http://localhost:9999/v1/events')
+
+    eventSource.onmessage = (event) => {
+      try {
+        const parsed = JSON.parse(event.data) as { timestamp: number; event_type: string; message: string; session_id?: string }
+        const date = new Date(parsed.timestamp * 1000)
+        const timestamp = date.toTimeString().slice(0, 8)
+
+        let phase: LogPhase = 'info'
+        if (parsed.event_type === 'fusion') phase = 'diag'
+        else if (parsed.event_type === 'execution') phase = 'exec'
+        else if (parsed.event_type === 'verify') phase = 'veri'
+        else if (parsed.event_type === 'error') phase = 'retry'
+
+        const newEntry: LogEntry = {
+          id: parsed.timestamp + '-' + Math.random().toString(36).slice(2, 7),
+          timestamp,
+          phase,
+          sessionId: parsed.session_id ? `session-${parsed.session_id.slice(0, 4)}` : 'gateway',
+          message: parsed.message,
+        }
+
+        setLogEntries((prev) => [...prev, newEntry])
+      } catch (e) {
+        console.error(e)
+      }
+    }
+
+    return () => {
+      clearInterval(interval)
+      eventSource.close()
+    }
+  }, [])
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
@@ -179,9 +254,16 @@ export function Dashboard() {
         </div>
       </div>
       <div style={{ flex: 1, overflowY: 'auto', padding: 24 }}>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 24, marginBottom: 24 }}>
-          {sessions.map((s) => <SessionCard key={s.id} session={s} />)}
-        </div>
+        {sessions.length === 0 ? (
+          <div style={{ padding: '40px 0', textAlign: 'center', color: 'var(--text-tertiary)', fontSize: '0.8125rem', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-lg)', border: '1px dashed var(--border-primary)', marginBottom: 24 }}>
+            No Active Sessions<br />
+            <span style={{ fontSize: '0.75rem' }}>Send requests to http://localhost:9999/v1/chat/completions</span>
+          </div>
+        ) : (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 24, marginBottom: 24 }}>
+            {sessions.map((s) => <SessionCard key={s.id} session={s} onEnd={endSession} />)}
+          </div>
+        )}
         <LogPanel entries={logEntries} />
       </div>
     </div>

@@ -4,8 +4,10 @@ use axum::{
     routing::{get, post},
     Router,
     Json,
+    http::StatusCode,
 };
 use serde_json::json;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 use crate::chat::{self, AppState};
@@ -106,6 +108,96 @@ async fn events_handler(
     events::event_stream(rx)
 }
 
+async fn get_sessions(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let sessions = state.session_manager.list();
+    let mut list = Vec::new();
+    for s in sessions {
+        let name = if let Some(first_msg) = s.messages.first() {
+            let content = &first_msg.content;
+            if content.len() > 30 {
+                format!("{}...", &content[..30])
+            } else {
+                content.to_string()
+            }
+        } else {
+            format!("#{}", &s.id[..4.min(s.id.len())])
+        };
+
+        let duration_secs = std::time::SystemTime::now()
+            .duration_since(s.created_at)
+            .unwrap_or_default()
+            .as_secs();
+
+        let duration_str = if duration_secs < 60 {
+            format!("{}s", duration_secs)
+        } else {
+            format!("{}m {}s", duration_secs / 60, duration_secs % 60)
+        };
+
+        let token_count = s.messages.iter().map(|m| m.content.len() / 4).sum::<usize>();
+
+        list.push(json!({
+            "id": s.id.clone(),
+            "name": name,
+            "state": format!("{:?}", s.state), // Diagnostic, Execution, Verify, Done
+            "retryCount": s.retry_count,
+            "maxRetries": 3,
+            "workers": "qwen2.5-coder:7b, deepseek-coder:6.7b",
+            "duration": duration_str,
+            "requests": s.retry_count + 1,
+            "tokens": token_count,
+            "createdAt": s.created_at
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() * 1000,
+        }));
+    }
+    Json(json!(list))
+}
+
+async fn delete_session(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Json<serde_json::Value> {
+    let removed = state.session_manager.remove(&id);
+    Json(json!({ "status": "ok", "removed": removed.is_some() }))
+}
+
+async fn get_metrics() -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    let path = std::path::PathBuf::from(home)
+        .join(".tinyfusion")
+        .join("fusion_metrics.jsonl");
+
+    if !path.exists() {
+        return Ok(Json(json!([])));
+    }
+
+    let content = std::fs::read_to_string(&path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Failed to read metrics: {}", e) })),
+        )
+    })?;
+
+    let mut metrics_list = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            metrics_list.push(parsed);
+        }
+    }
+
+    Ok(Json(json!(metrics_list)))
+}
+
 pub fn app(config: Config) -> Router {
     let state = AppState::new(config);
     let loaded = state.session_manager.load_snapshot();
@@ -113,11 +205,20 @@ pub fn app(config: Config) -> Router {
         tracing::info!("Restored {} sessions from snapshot", loaded);
     }
 
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     Router::new()
         .route("/health", get(health_check))
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/v1/events", get(events_handler))
         .route("/v1/config", get(get_config).post(post_config))
+        .route("/v1/sessions", get(get_sessions))
+        .route("/v1/sessions/:id", axum::routing::delete(delete_session))
+        .route("/v1/metrics", get(get_metrics))
+        .layer(cors)
         .with_state(state)
 }
 

@@ -1,7 +1,24 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect } from 'react'
 import { Search, X, Download } from 'lucide-react'
 
 type LogPhase = 'diag' | 'exec' | 'veri' | 'retry' | 'info'
+
+interface MetricDetail {
+  request_id: string
+  timestamp: number
+  total_latency_ms: number
+  outer_model: string
+  panel_models: string[]
+  judge_model: string
+  panel_latencies_ms: number[]
+  judge_latency_ms: number
+  refiner_latency_ms: number
+  consensus_count: number
+  contradiction_count: number
+  blind_spot_count: number
+  panel_success_count: number
+  panel_failure_count: number
+}
 
 interface LogEntry {
   id: string
@@ -12,6 +29,7 @@ interface LogEntry {
   requestSize?: number
   workers?: string
   judge?: string
+  rawMetrics?: MetricDetail
 }
 
 const PHASE_COLORS: Record<LogPhase, { bg: string; text: string; border: string }> = {
@@ -22,39 +40,62 @@ const PHASE_COLORS: Record<LogPhase, { bg: string; text: string; border: string 
   info: { bg: 'var(--bg-tertiary)', text: 'var(--text-secondary)', border: 'var(--border-primary)' },
 }
 
-function generateLogs(): LogEntry[] {
-  const t = new Date().toISOString().slice(11, 19)
-  return [
-    { id: '1', timestamp: t, phase: 'diag', sessionId: 'session-a3f2', message: 'Diagnostic phase started', requestSize: 4231, workers: 'qwen2.5-coder:7b, deepseek-coder:6.7b', judge: 'claude-3.5-sonnet' },
-    { id: '2', timestamp: t, phase: 'diag', sessionId: 'session-a3f2', message: 'Worker spawn: 3 workers dispatched' },
-    { id: '3', timestamp: t, phase: 'diag', sessionId: 'session-a3f2', message: 'Worker qwen-coder responded (1.2s)' },
-    { id: '4', timestamp: t, phase: 'diag', sessionId: 'session-a3f2', message: 'Judge invoked (claude-3.5-sonnet)' },
-    { id: '5', timestamp: t, phase: 'exec', sessionId: 'session-a3f2', message: 'Passthrough → deepseek-chat' },
-    { id: '6', timestamp: t, phase: 'exec', sessionId: 'session-a3f2', message: 'Tool call: apply_changes to src/main.rs' },
-    { id: '7', timestamp: t, phase: 'veri', sessionId: 'session-a3f2', message: 'Build started: cargo build' },
-    { id: '8', timestamp: t, phase: 'veri', sessionId: 'session-a3f2', message: 'Build passed, running tests' },
-    { id: '9', timestamp: t, phase: 'info', sessionId: 'session-a3f2', message: 'Session done' },
-  ]
-}
-
 export function Logs() {
-  const logs = useMemo(() => generateLogs(), [])
+  const [logs, setLogs] = useState<LogEntry[]>([])
   const [search, setSearch] = useState('')
   const [phaseFilter, setPhaseFilter] = useState<Set<LogPhase>>(new Set())
   const [sessionFilter, setSessionFilter] = useState<Set<string>>(new Set())
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [exportOpen, setExportOpen] = useState(false)
 
+  const fetchLogs = () => {
+    fetch('http://localhost:9999/v1/metrics')
+      .then((res) => res.json())
+      .then((data) => {
+        const mapped = data.map((m: MetricDetail) => {
+          const date = new Date(m.timestamp * 1000)
+          return {
+            id: m.request_id,
+            timestamp: date.toTimeString().slice(0, 8),
+            phase: (m.panel_failure_count > 0 ? 'retry' : 'diag') as LogPhase,
+            sessionId: `session-${m.request_id.slice(0, 4)}`,
+            message: `Deliberation complete via ${m.judge_model}. Latency: ${m.total_latency_ms}ms. Consensus: ${m.consensus_count}, Contradictions: ${m.contradiction_count}`,
+            requestSize: m.total_latency_ms > 2000 ? 3200 : 1200,
+            workers: m.panel_models.join(', '),
+            judge: m.judge_model,
+            rawMetrics: m,
+          }
+        })
+        mapped.reverse()
+        setLogs(mapped)
+      })
+      .catch((err) => {
+        console.error('Failed to fetch logs:', err)
+      })
+  }
+
+  useEffect(() => {
+    fetchLogs()
+  }, [])
+
   const sessions = useMemo(() => [...new Set(logs.map((l) => l.sessionId))], [logs])
 
   const togglePhase = (p: LogPhase) => {
     const next = new Set(phaseFilter)
-    next.has(p) ? next.delete(p) : next.add(p)
+    if (next.has(p)) {
+      next.delete(p)
+    } else {
+      next.add(p)
+    }
     setPhaseFilter(next)
   }
   const toggleSession = (s: string) => {
     const next = new Set(sessionFilter)
-    next.has(s) ? next.delete(s) : next.add(s)
+    if (next.has(s)) {
+      next.delete(s)
+    } else {
+      next.add(s)
+    }
     setSessionFilter(next)
   }
   const clearFilters = () => { setSearch(''); setPhaseFilter(new Set()); setSessionFilter(new Set()) }
@@ -125,10 +166,18 @@ export function Logs() {
                 </div>
                 {isExpanded && (
                   <div style={{ padding: '12px 16px', background: 'var(--bg-tertiary)', borderBottom: '1px solid var(--border-subtle)', fontSize: '0.75rem', color: 'var(--text-secondary)', fontFamily: 'var(--font-mono)' }}>
-                    <div>Session ID: {entry.sessionId}</div>
-                    {entry.requestSize && <div>Request Size: {entry.requestSize.toLocaleString()} tokens</div>}
-                    {entry.workers && <div>Workers: {entry.workers}</div>}
-                    {entry.judge && <div>Judge: {entry.judge}</div>}
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+                      <div>Session ID: <span style={{ color: 'var(--text-primary)' }}>{entry.id}</span></div>
+                      <div>Judge: <span style={{ color: 'var(--text-primary)' }}>{entry.judge}</span></div>
+                      <div>Workers: <span style={{ color: 'var(--text-primary)' }}>{entry.workers}</span></div>
+                      <div>Total Latency: <span style={{ color: 'var(--text-primary)' }}>{entry.rawMetrics?.total_latency_ms}ms</span></div>
+                    </div>
+                    <details style={{ marginTop: 8 }}>
+                      <summary style={{ cursor: 'pointer', color: 'var(--accent-primary)', marginBottom: 6 }}>View Full Metrics JSON</summary>
+                      <pre style={{ padding: 12, background: 'var(--bg-primary)', borderRadius: 'var(--radius-md)', overflowX: 'auto', maxHeight: 200, fontSize: '0.7rem' }}>
+                        {JSON.stringify(entry.rawMetrics, null, 2)}
+                      </pre>
+                    </details>
                   </div>
                 )}
               </div>

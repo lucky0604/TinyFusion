@@ -110,7 +110,7 @@ impl FusionGuard {
 }
 
 /// Model alias for the Fusion deliberation pipeline.
-pub const FUSION_MODEL_ALIAS: &str = "tinyfusion/fusion";
+pub const FUSION_MODEL_ALIAS: &str = "tinyfusion";
 /// Tool name used for the Fusion deliberation pipeline.
 pub const FUSION_TOOL_NAME: &str = "tinyfusion_deliberate";
 
