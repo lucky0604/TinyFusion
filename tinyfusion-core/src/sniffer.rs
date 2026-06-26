@@ -18,6 +18,8 @@ pub fn sniff_state(messages: &[Message]) -> RequestState {
 }
 
 /// Inspect messages using caller-provided error keywords (from config).
+/// When `error_keywords` is non-empty, only those keywords are checked (DRY).
+/// When empty, falls back to built-in defaults for backward compatibility.
 pub fn sniff_state_with_keywords(
     messages: &[Message],
     error_keywords: &[String],
@@ -34,15 +36,16 @@ pub fn sniff_state_with_keywords(
 
     if let Some(last) = messages.last() {
         let lower = last.content.to_lowercase();
-        let matches_keyword = error_keywords
-            .iter()
-            .any(|kw| lower.contains(&kw.to_lowercase()));
-        if matches_keyword {
-            return RequestState::Diagnostic;
-        }
-        let matches_default = DEFAULT_ERROR_KEYWORDS.iter().any(|kw| lower.contains(kw));
-        if matches_default {
-            return RequestState::Diagnostic;
+        if error_keywords.is_empty() {
+            // No caller keywords → use built-in defaults
+            if DEFAULT_ERROR_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+                return RequestState::Diagnostic;
+            }
+        } else {
+            // Caller provided keywords → use only those (single source of truth)
+            if error_keywords.iter().any(|kw| lower.contains(&kw.to_lowercase())) {
+                return RequestState::Diagnostic;
+            }
         }
     }
 
@@ -156,5 +159,32 @@ mod tests {
             Message { role: "user".into(), content: "The production is running fine".into() },
         ];
         assert_eq!(sniff_state(&messages), RequestState::Execution);
+    }
+
+    #[test]
+    fn test_custom_keywords_override_defaults() {
+        // "panic" is in DEFAULT_ERROR_KEYWORDS but when custom keywords are provided,
+        // only custom keywords should be checked
+        let messages = vec![
+            Message { role: "user".into(), content: "thread panicked at main.rs".into() },
+        ];
+        let custom_kw = vec!["segfault".into()]; // doesn't include "panic"
+        assert_eq!(
+            sniff_state_with_keywords(&messages, &custom_kw),
+            RequestState::Execution,
+            "Custom keywords should NOT fall back to defaults"
+        );
+    }
+
+    #[test]
+    fn test_empty_custom_keywords_uses_defaults() {
+        let messages = vec![
+            Message { role: "user".into(), content: "thread panicked at main.rs".into() },
+        ];
+        assert_eq!(
+            sniff_state_with_keywords(&messages, &[]),
+            RequestState::Diagnostic,
+            "Empty custom keywords should fall back to built-in defaults"
+        );
     }
 }
